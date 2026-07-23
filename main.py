@@ -952,6 +952,13 @@ def _parse_ai_response(ai_text: str) -> tuple[str, Optional[dict]]:
     _flatten_products(obj)
     _normalize_product_arrays(obj)
     message = "\n\n".join(p for p in (obj.get("opening"), obj.get("closing")) if p)
+    if not message:
+        # Failure/no-match responses often send opening=null, closing=null —
+        # fall back to the human-readable status.message instead of dumping
+        # the raw JSON blob as the chat message.
+        status = obj.get("status")
+        if isinstance(status, dict) and status.get("message"):
+            message = status["message"]
     return (message or ai_text), obj
 
 
