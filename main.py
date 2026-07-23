@@ -19,6 +19,7 @@ import redis.asyncio as redis_asyncio
 import jwt as pyjwt
 import httpx
 import asyncio
+import random
 
 from search_engine import ProductSearchEngine
 import otp_auth
@@ -801,11 +802,15 @@ async def get_chat_history(
         else:
             message_text, structured = _parse_ai_response(text)
             has_products = bool(structured and structured.get("products"))
+            content_type = None
+            if has_products:
+                content_type = structured.get("intent") or "product_discovery"
+                structured["contentType"] = content_type
             content = (PRODUCT_WIDGET_MARKER + message_text) if has_products else message_text
             messages.append(ChatHistoryMessage(
                 role="assistant",
                 content=content,
-                content_type="product_discovery" if has_products else None,
+                content_type=content_type,
                 structured_data=[structured] if has_products else None,
                 session_id=sid,
                 created_at=_to_iso(created_at),
@@ -827,6 +832,60 @@ PRODUCT_WIDGET_MARKER = ":::PRODUCT_WIDGET:::"
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
 
 
+def _extract_ai_text(output_obj: dict) -> Optional[str]:
+    """variables.text is the clean, flat JSON string matching the intent's
+    schema. workflow_response.content is sometimes a nested dict (e.g.
+    {"result": {...fields double-encoded...}}) rather than a string, which
+    breaks downstream str-only consumers (DB insert, _parse_ai_response).
+    Prefer text; only fall back to content if it's actually a string."""
+    text = output_obj.get("variables", {}).get("text")
+    if isinstance(text, str):
+        return text
+    content = output_obj.get("workflow_response", {}).get("content")
+    if isinstance(content, str):
+        return content
+    return None
+
+
+async def _call_cartesian_workflow(client: httpx.AsyncClient, url: str, poll_url_base: str, params: dict, payload: dict, headers: dict) -> Optional[str]:
+    """Runs the full Cartesian call (initial POST, then the poll loop if the
+    job was accepted for async processing). Returns the extracted ai_text,
+    or None if nothing usable came back. Runs as a background task so the
+    caller can tick status messages independently of this function's cadence."""
+    response = await client.post(url, json=payload, params=params, headers=headers, timeout=40)
+    response.raise_for_status()
+    data = response.json()
+    logger.info("cartesian: initial response status=%s body=%s", response.status_code, data)
+    resp_data = data.get("data", data)
+
+    if resp_data.get("ok") and resp_data.get("accepted"):
+        run_id = resp_data.get("runId")
+        poll_url = f"{poll_url_base}/{run_id}"
+        logger.info("cartesian: job accepted async, runId=%s, polling %s", run_id, poll_url)
+        max_retries = 30
+        for attempt in range(max_retries):
+            await asyncio.sleep(2)
+            poll_resp = await client.get(poll_url, headers=headers, timeout=10)
+            poll_resp.raise_for_status()
+            poll_data_raw = poll_resp.json()
+            poll_data = poll_data_raw.get("data", poll_data_raw)
+            logger.info(
+                "cartesian: poll attempt %d/%d isCompleted=%s body=%s",
+                attempt + 1, max_retries, poll_data.get("isCompleted"), poll_data_raw,
+            )
+            if poll_data.get("isCompleted"):
+                return _extract_ai_text(poll_data.get("output", {}))
+        logger.error("cartesian: timed out after %d poll attempts", max_retries)
+        return None
+
+    if resp_data.get("ok") and not resp_data.get("accepted"):
+        logger.info("cartesian: completed synchronously within wait window")
+        return _extract_ai_text(resp_data.get("output", {}))
+
+    logger.error("cartesian: no ai_text extractable from response: %s", data)
+    return None
+
+
 def _to_iso(ts: datetime) -> str:
     """Postgres TIMESTAMPTZ comes back from asyncpg as a tz-aware datetime.
     Normalize to UTC and drop the offset for a plain ISO 8601 string."""
@@ -839,6 +898,22 @@ _PRODUCT_ARRAY_STRING_FIELDS = (
     "available_colors", "available_sizes", "available_materials",
     "available_features", "available_fits", "tags",
 )
+
+
+def _flatten_products(structured: dict) -> None:
+    """Every intent except 'budget' sends products as a flat list of product
+    dicts. 'budget' wraps them one level deeper as [{query, items:[...]}, ...].
+    Flatten that here so the frontend's product grid renderer never has to
+    branch on intent."""
+    products = structured.get("products")
+    if not isinstance(products, list) or not products:
+        return
+    if isinstance(products[0], dict) and "items" in products[0]:
+        flat = []
+        for group in products:
+            if isinstance(group, dict) and isinstance(group.get("items"), list):
+                flat.extend(item for item in group["items"] if isinstance(item, dict))
+        structured["products"] = flat
 
 
 def _normalize_product_arrays(structured: dict) -> None:
@@ -874,6 +949,7 @@ def _parse_ai_response(ai_text: str) -> tuple[str, Optional[dict]]:
         return ai_text, None
     if not isinstance(obj, dict):
         return ai_text, None
+    _flatten_products(obj)
     _normalize_product_arrays(obj)
     message = "\n\n".join(p for p in (obj.get("opening"), obj.get("closing")) if p)
     return (message or ai_text), obj
@@ -961,57 +1037,41 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
     url = f"{base_url.rstrip('/')}{CARTESIAN_JOB_PATH}"
 
     ai_text: Optional[str] = None
-    yield f"event: status\ndata: {json.dumps({'v': STATUS_MESSAGES[0]})}\n\n"
+    yield f"event: status\ndata: {json.dumps({'v': random.choice(STATUS_MESSAGES)})}\n\n"
 
     logger.info("cartesian: POST %s params=%s", url, params)
 
     async with httpx.AsyncClient() as client:
+        poll_url_base = f"{base_url.rstrip('/')}{CARTESIAN_JOB_PATH}"
+        task = asyncio.create_task(
+            _call_cartesian_workflow(client, url, poll_url_base, params, payload, headers)
+        )
+
+        # Status ticks run on their own 3-5s cadence, fully decoupled from
+        # whatever Cartesian is doing internally (sync wait or async polling)
+        # so the frontend always sees continuous progress regardless of path.
+        shuffled = random.sample(STATUS_MESSAGES, len(STATUS_MESSAGES))
+        tick_idx = 0
         try:
-            response = await client.post(url, json=payload, params=params, headers=headers, timeout=40)
-            response.raise_for_status()
-            data = response.json()
-            logger.info("cartesian: initial response status=%s body=%s", response.status_code, data)
-            resp_data = data.get("data", data)
+            while not task.done():
+                done, _ = await asyncio.wait({task}, timeout=random.uniform(3, 5))
+                if task in done:
+                    break
+                yield f"event: status\ndata: {json.dumps({'v': shuffled[tick_idx % len(shuffled)]})}\n\n"
+                tick_idx += 1
+                if tick_idx % len(shuffled) == 0:
+                    shuffled = random.sample(STATUS_MESSAGES, len(STATUS_MESSAGES))
 
-            if resp_data.get("ok") and resp_data.get("accepted"):
-                run_id = resp_data.get("runId")
-                poll_url = f"{base_url.rstrip('/')}{CARTESIAN_JOB_PATH}/{run_id}"
-                logger.info("cartesian: job accepted async, runId=%s, polling %s", run_id, poll_url)
-                max_retries = 30
-                for attempt in range(max_retries):
-                    yield f"event: status\ndata: {json.dumps({'v': STATUS_MESSAGES[(attempt + 1) % len(STATUS_MESSAGES)]})}\n\n"
-                    await asyncio.sleep(2)
-                    poll_resp = await client.get(poll_url, headers=headers, timeout=10)
-                    poll_resp.raise_for_status()
-                    poll_data_raw = poll_resp.json()
-                    poll_data = poll_data_raw.get("data", poll_data_raw)
-                    logger.info(
-                        "cartesian: poll attempt %d/%d isCompleted=%s body=%s",
-                        attempt + 1, max_retries, poll_data.get("isCompleted"), poll_data_raw,
-                    )
-                    if poll_data.get("isCompleted"):
-                        output_obj = poll_data.get("output", {})
-                        ai_text = output_obj.get("workflow_response", {}).get("content") or output_obj.get("variables", {}).get("text")
-                        break
-                if ai_text is None:
-                    logger.error("cartesian: timed out after %d poll attempts", max_retries)
-                    yield f"event: error\ndata: {json.dumps({'detail': 'Timed out waiting for the AI service.'})}\n\n"
-                    return
-
-            elif resp_data.get("ok") and not resp_data.get("accepted"):
-                logger.info("cartesian: completed synchronously within wait window")
-                output_obj = resp_data.get("output", {})
-                ai_text = output_obj.get("workflow_response", {}).get("content") or output_obj.get("variables", {}).get("text")
-
-            if ai_text is None:
-                logger.error("cartesian: no ai_text extractable from response: %s", data)
-                yield f"event: error\ndata: {json.dumps({'detail': 'Unexpected response from the AI service.'})}\n\n"
-                return
-
+            ai_text = await task
         except httpx.HTTPError as e:
             logger.error("cartesian: HTTP error communicating with Cartesian: %s", e)
             yield f"event: error\ndata: {json.dumps({'detail': f'AI service communication error: {str(e)}'})}\n\n"
             return
+
+    if ai_text is None:
+        logger.error("cartesian: no ai_text extractable from response")
+        yield f"event: error\ndata: {json.dumps({'detail': 'Unexpected response from the AI service.'})}\n\n"
+        return
 
     logger.info("cartesian: extracted ai_text (%d chars): %r", len(ai_text), ai_text)
 
@@ -1029,7 +1089,7 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
     )
     yield f"event: message\ndata: {json.dumps({'v': message_text})}\n\n"
     if structured and structured.get("products"):
-        structured["contentType"] = "product_discovery"
+        structured["contentType"] = structured.get("intent") or "product_discovery"
         yield f"event: product_discovery\ndata: {json.dumps({'v': [structured]})}\n\n"
 
     yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
