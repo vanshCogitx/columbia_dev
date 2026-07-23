@@ -814,7 +814,7 @@ async def get_chat_history(
     return ChatHistoryResponse(email=norm_email, messages=messages)
 
 
-CARTESIAN_JOB_PATH = "/exports/rest-api/6a5a695f285cc674dbde9573/jobs"
+CARTESIAN_JOB_PATH = "/exports/rest-api/6a60f95529131252a1e0746a/jobs"
 STATUS_MESSAGES = [
     "Thinking...",
     "Searching the catalog...",
