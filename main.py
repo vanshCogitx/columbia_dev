@@ -22,6 +22,7 @@ import asyncio
 import random
 
 from search_engine import ProductSearchEngine
+from search_engine_v2 import CatalogSearchEngineV2
 import otp_auth
 
 logging.basicConfig(
@@ -30,8 +31,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("columbia_backend")
 
-# Global search engine instance
+# Global search engine instance (relational — Pinecone + Supabase)
 engine = ProductSearchEngine()
+
+# Flat catalog search engine (pure Pinecone, no DB)
+catalog_engine_v2 = CatalogSearchEngineV2()
 
 # Global Postgres (Supabase) connection pool, set during lifespan startup
 db_pool: Optional[asyncpg.Pool] = None
@@ -220,6 +224,7 @@ async def lifespan(app: FastAPI):
         await init_db(db_pool)
         engine.pool = db_pool
         engine.load_data()
+        catalog_engine_v2.load_data()
 
         redis_client = redis_asyncio.Redis(
             host=os.getenv("REDIS_HOST"),
@@ -458,6 +463,74 @@ class CartesianChatRequest(BaseModel):
     wait_seconds: Optional[int] = Field(30, description="Optional override for sync wait duration in seconds (max 30 for inline wait)")
     session_id: Optional[str] = Field(None, description="Optional conversation session identifier. Reuse this across calls to continue context.")
 
+# --- V2 Flat Catalog Schemas ---
+
+class CatalogSearchRequestV2(BaseModel):
+    query: str = Field(
+        ...,
+        description=(
+            "A natural language search query describing what the user is looking for. "
+            "E.g., 'waterproof hiking jacket in blue', 'kids fleece jacket', 'trekking poles'. "
+            "This field is required — all retrieval is semantic."
+        )
+    )
+    category_level_1: Optional[str] = Field(
+        None,
+        description="Primary department or category filter (e.g., 'Apparel', 'Accessories', 'Bags & Gear')."
+    )
+    category_level_2: Optional[str] = Field(
+        None,
+        description="Secondary category / demographic filter (e.g., \"Men's\", \"Women's\", 'Kids', 'Unisex')."
+    )
+    product_type: Optional[str] = Field(
+        None,
+        description="Product type filter (e.g., 'Sportswear', 'Equipment', 'Accessories')."
+    )
+    sport: Optional[str] = Field(
+        None,
+        description="Sport or activity filter (e.g., 'Hiking', 'Casual', 'Running')."
+    )
+    price_min: Optional[float] = Field(
+        None,
+        description="Minimum price filter (inclusive). Products priced below this value are excluded."
+    )
+    price_max: Optional[float] = Field(
+        None,
+        description="Maximum price filter (inclusive). Products priced above this value are excluded."
+    )
+    color: Optional[str] = Field(
+        None,
+        description="Exact color filter (e.g., 'Black', 'Blue', 'Maroon')."
+    )
+    size: Optional[str] = Field(
+        None,
+        description="Exact size filter (e.g., 'S', 'M', 'L', 'XL', 'XXS', 'OS')."
+    )
+    top_k: int = Field(
+        10,
+        description="Maximum number of products to return (default 10)."
+    )
+
+class CatalogProductResultV2(BaseModel):
+    product_id: str = Field(..., description="Unique SKU / product ID.")
+    name: str = Field(..., description="Full product name.")
+    price: float = Field(..., description="Product price.")
+    category_level_1: str = Field(..., description="Primary department/category.")
+    category_level_2: str = Field(..., description="Secondary category/demographic.")
+    product_type: str = Field(..., description="Product type classification.")
+    sport: str = Field(..., description="Sport or activity.")
+    color: str = Field(..., description="Product color.")
+    material: str = Field(..., description="Product material.")
+    fit: str = Field(..., description="Fit style (e.g., Regular, Slim, Comfort Stretch).")
+    features: str = Field(..., description="Key product features.")
+    size: str = Field(..., description="Available size for this SKU.")
+    stock_quantity: int = Field(..., description="Units currently in stock.")
+    availability: str = Field(..., description="'in_stock' or 'out_of_stock'.")
+    url: str = Field(..., description="Product detail page URL.")
+    image_url: str = Field(..., description="Product image URL.")
+    description_snippet: str = Field(..., description="Short description excerpt.")
+    score: float = Field(..., description="Semantic similarity score (cosine, 0–1).")
+
 # --- API Tool Endpoints ---
 
 @app.post(
@@ -497,6 +570,50 @@ async def search_products(request: SearchRequest = Body(...)):
     except Exception as e:
         logger.error("TOOL search-products: failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+
+@app.post(
+    "/tools/search-products-v2",
+    response_model=List[CatalogProductResultV2],
+    dependencies=[Depends(verify_api_key)],
+    tags=["search tools"],
+    summary="Flat catalog semantic search (V2)",
+    description=(
+        "Semantic search tool for the flat product catalog (product_catalog_2_3_unique dataset). "
+        "Results are retrieved entirely from Pinecone — no database joins. "
+        "A natural language 'query' is always required. Optional structured filters "
+        "(category, sport, color, size, price range) are applied as Pinecone metadata pre-filters "
+        "with progressive relaxation to maximise result coverage. "
+        "Uses the same Google Gemma embedding model as the primary search tool."
+    )
+)
+async def search_products_v2(request: CatalogSearchRequestV2 = Body(...)):
+    logger.info("TOOL search-products-v2: request=%s", request.model_dump(exclude_none=True))
+    try:
+        results = await catalog_engine_v2.search(
+            query=request.query,
+            category_level_1=request.category_level_1,
+            category_level_2=request.category_level_2,
+            product_type=request.product_type,
+            sport=request.sport,
+            price_min=request.price_min,
+            price_max=request.price_max,
+            color=request.color,
+            size=request.size,
+            top_k=request.top_k,
+        )
+        logger.info(
+            "TOOL search-products-v2: %d products returned: %s",
+            len(results), [r["product_id"] for r in results],
+        )
+        return results
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error("TOOL search-products-v2: failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"V2 search failed: {str(e)}")
 
 
 @app.get(
