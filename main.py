@@ -462,6 +462,7 @@ class CartesianChatRequest(BaseModel):
     text: str = Field(..., description="User input text")
     wait_seconds: Optional[int] = Field(30, description="Optional override for sync wait duration in seconds (max 30 for inline wait)")
     session_id: Optional[str] = Field(None, description="Optional conversation session identifier. Reuse this across calls to continue context.")
+    user_id: Optional[str] = Field(None, description="Identifier for the requesting user, required by the workflow's input schema.")
 
 # --- V2 Flat Catalog Schemas ---
 
@@ -659,7 +660,10 @@ async def chat_endpoint(request: CartesianChatRequest = Body(...)):
     }
 
     payload = {
-        "text": request.text
+        "payload": {
+            "user_query": request.text,
+            "user_id": request.user_id or "test-user"
+        }
     }
 
     params = {}
@@ -668,7 +672,7 @@ async def chat_endpoint(request: CartesianChatRequest = Body(...)):
     if request.session_id:
         params["sessionId"] = request.session_id
 
-    endpoint_path = "/exports/rest-api/6a55bcbe27feee28b3fe077b/jobs"
+    endpoint_path = "/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs"
     url = f"{base_url.rstrip('/')}{endpoint_path}"
 
     async with httpx.AsyncClient() as client:
@@ -690,7 +694,7 @@ async def chat_endpoint(request: CartesianChatRequest = Body(...)):
             if not run_id:
                 raise HTTPException(status_code=500, detail="Received accepted response but no runId")
 
-            poll_url = f"{base_url.rstrip('/')}/exports/rest-api/6a55bcbe27feee28b3fe077b/jobs/{run_id}"
+            poll_url = f"{base_url.rstrip('/')}/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs/{run_id}"
 
             # Poll until complete or timeout (e.g. 30 times with 2s delay = ~60s wait)
             max_retries = 30
