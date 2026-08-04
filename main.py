@@ -1056,10 +1056,10 @@ def _normalize_product_arrays(structured: dict) -> None:
 
 
 def _parse_ai_response(ai_text: str) -> tuple[str, Optional[dict]]:
-    """Cartesian returns a JSON-object string ({"opening","status","products",
-    "activity_context","closing"}) for product replies, or plain prose for
-    everything else. The object may also arrive wrapped in a ```json fence.
-    Returns (display_message, structured_object_or_None)."""
+    """Cartesian returns a JSON-object string ({"introduction","orientation",
+    "opening","status","products","recovery","closing"}) for product replies,
+    or plain prose for everything else. The object may also arrive wrapped
+    in a ```json fence. Returns (display_message, structured_object_or_None)."""
     candidate = ai_text.strip()
     fence_match = _CODE_FENCE_RE.search(candidate)
     if fence_match:
@@ -1072,7 +1072,15 @@ def _parse_ai_response(ai_text: str) -> tuple[str, Optional[dict]]:
         return ai_text, None
     _flatten_products(obj)
     _normalize_product_arrays(obj)
-    message = "\n\n".join(p for p in (obj.get("opening"), obj.get("closing")) if p)
+    message = "\n\n".join(
+        p for p in (
+            obj.get("introduction"),
+            obj.get("orientation"),
+            obj.get("opening"),
+            obj.get("recovery"),
+            obj.get("closing"),
+        ) if p
+    )
     if not message:
         # Failure/no-match responses often send opening=null, closing=null —
         # fall back to the human-readable status.message instead of dumping
