@@ -905,9 +905,20 @@ async def get_chat_history(
 
         session_by_chat = {r["id"]: r["session_id"] for r in chat_rows}
         chat_ids = list(session_by_chat.keys())
+        # Cap per chat_id (most recent `limit` messages each), not with one
+        # limit shared across every chat — otherwise one long-running chat
+        # can starve the others out of the response entirely.
         rows = await db_pool.fetch(
-            "SELECT chat_id, sender, text, created_at FROM messages "
-            "WHERE chat_id = ANY($1::int[]) ORDER BY created_at ASC LIMIT $2",
+            """
+            SELECT chat_id, sender, text, created_at FROM (
+                SELECT chat_id, sender, text, created_at,
+                       ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY created_at DESC) AS rn
+                FROM messages
+                WHERE chat_id = ANY($1::int[])
+            ) ranked
+            WHERE rn <= $2
+            ORDER BY created_at ASC
+            """,
             chat_ids, limit,
         )
     except asyncpg.PostgresError as e:
@@ -1021,6 +1032,20 @@ _PRODUCT_ARRAY_STRING_FIELDS = (
 )
 
 
+def _coerce_products_list(structured: dict) -> None:
+    """Cartesian sometimes double-encodes 'products' as a JSON string instead
+    of a real array. Parse it in place so _flatten_products/_normalize_product_arrays
+    (which both require an actual list) don't silently no-op on it."""
+    products = structured.get("products")
+    if isinstance(products, str):
+        try:
+            parsed = json.loads(products)
+        except json.JSONDecodeError:
+            return
+        if isinstance(parsed, list):
+            structured["products"] = parsed
+
+
 def _flatten_products(structured: dict) -> None:
     """Every intent except 'budget' sends products as a flat list of product
     dicts. 'budget' wraps them one level deeper as [{query, items:[...]}, ...].
@@ -1070,6 +1095,7 @@ def _parse_ai_response(ai_text: str) -> tuple[str, Optional[dict]]:
         return ai_text, None
     if not isinstance(obj, dict):
         return ai_text, None
+    _coerce_products_list(obj)
     _flatten_products(obj)
     _normalize_product_arrays(obj)
     message = "\n\n".join(
