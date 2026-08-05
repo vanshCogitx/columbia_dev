@@ -962,6 +962,7 @@ PRODUCT_WIDGET_MARKER = ":::PRODUCT_WIDGET:::"
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
+_NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType"}
 
 
 def _extract_ai_text(output_obj: dict) -> Optional[str]:
@@ -1152,16 +1153,29 @@ def _iter_product_groups(products) -> list[tuple[Optional[str], list]]:
 
 
 def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], list]], list[str]]:
-    """Streaming variant of _parse_ai_response: instead of joining the
-    narrative fields into one string, returns them as separate ordered
-    pieces — head (introduction/orientation/opening) before the products,
-    tail (recovery/closing) after — plus each product group as its own flat
-    (product_type, products) pair, one SSE event apiece."""
+    """Streaming variant of _parse_ai_response: instead of hardcoding which
+    field names count as narrative text (introduction/orientation/opening/
+    recovery/closing), walks the object's own keys in order and treats any
+    non-empty string value as a message — so a new or renamed narrative
+    field from Cartesian is picked up automatically instead of silently
+    dropped. 'products' is pulled out separately as product groups;
+    'status'/'intent'/'contentType' are metadata, not display text.
+    Returns (head, groups, tail): head = narrative strings that appeared
+    before 'products' in the object, tail = the ones that appeared after."""
     obj = _extract_structured_obj(ai_text)
     if obj is None:
         return [ai_text], [], []
-    head = [obj[f] for f in ("introduction", "orientation", "opening") if obj.get(f)]
-    tail = [obj[f] for f in ("recovery", "closing") if obj.get(f)]
+    head: list[str] = []
+    tail: list[str] = []
+    seen_products = False
+    for key, value in obj.items():
+        if key == "products":
+            seen_products = True
+            continue
+        if key in _NON_NARRATIVE_KEYS:
+            continue
+        if isinstance(value, str) and value:
+            (tail if seen_products else head).append(value)
     if not head and not tail:
         status = obj.get("status")
         if isinstance(status, dict) and status.get("message"):
