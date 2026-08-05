@@ -1080,11 +1080,12 @@ def _normalize_product_arrays(structured: dict) -> None:
                     product[field] = parsed
 
 
-def _parse_ai_response(ai_text: str) -> tuple[str, Optional[dict]]:
-    """Cartesian returns a JSON-object string ({"introduction","orientation",
-    "opening","status","products","recovery","closing"}) for product replies,
-    or plain prose for everything else. The object may also arrive wrapped
-    in a ```json fence. Returns (display_message, structured_object_or_None)."""
+def _extract_structured_obj(ai_text: str) -> Optional[dict]:
+    """Parses ai_text (optionally ```json-fenced) into the structured dict
+    Cartesian sends for product replies ({"introduction","orientation",
+    "opening","status","products","recovery","closing"}), normalizing the
+    products field in place. Returns None for plain prose or anything that
+    isn't a JSON object."""
     candidate = ai_text.strip()
     fence_match = _CODE_FENCE_RE.search(candidate)
     if fence_match:
@@ -1092,12 +1093,22 @@ def _parse_ai_response(ai_text: str) -> tuple[str, Optional[dict]]:
     try:
         obj = json.loads(candidate)
     except (json.JSONDecodeError, TypeError):
-        return ai_text, None
+        return None
     if not isinstance(obj, dict):
-        return ai_text, None
+        return None
     _coerce_products_list(obj)
     _flatten_products(obj)
     _normalize_product_arrays(obj)
+    return obj
+
+
+def _parse_ai_response(ai_text: str) -> tuple[str, Optional[dict]]:
+    """Joins the narrative fields into one display message. Used by chat
+    history replay, where a single past message is rendered as one block.
+    Returns (display_message, structured_object_or_None)."""
+    obj = _extract_structured_obj(ai_text)
+    if obj is None:
+        return ai_text, None
     message = "\n\n".join(
         p for p in (
             obj.get("introduction"),
@@ -1115,6 +1126,50 @@ def _parse_ai_response(ai_text: str) -> tuple[str, Optional[dict]]:
         if isinstance(status, dict) and status.get("message"):
             message = status["message"]
     return (message or ai_text), obj
+
+
+def _iter_product_groups(products) -> list[tuple[Optional[str], list]]:
+    """Yields (product_type, flat_product_list) pairs so the caller can
+    stream each group as its own product_discovery event with a plain
+    (non-nested) product array. Handles both the grouped shape
+    ([{"product_type", "products": [...]}, ...]) and an already-flat list
+    of product dicts (e.g. budget intent, post-_flatten_products)."""
+    if not isinstance(products, list) or not products:
+        return []
+    if isinstance(products[0], dict) and isinstance(products[0].get("products"), list):
+        groups = []
+        for group in products:
+            if not isinstance(group, dict):
+                continue
+            ptype = group.get("product_type")
+            items = [p for p in group.get("products", []) if isinstance(p, dict)]
+            if ptype:
+                for item in items:
+                    item.setdefault("product_type", ptype)
+            groups.append((ptype, items))
+        return groups
+    return [(None, [p for p in products if isinstance(p, dict)])]
+
+
+def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], list]], list[str]]:
+    """Streaming variant of _parse_ai_response: instead of joining the
+    narrative fields into one string, returns them as separate ordered
+    pieces — head (introduction/orientation/opening) before the products,
+    tail (recovery/closing) after — plus each product group as its own flat
+    (product_type, products) pair, one SSE event apiece."""
+    obj = _extract_structured_obj(ai_text)
+    if obj is None:
+        return [ai_text], [], []
+    head = [obj[f] for f in ("introduction", "orientation", "opening") if obj.get(f)]
+    tail = [obj[f] for f in ("recovery", "closing") if obj.get(f)]
+    if not head and not tail:
+        status = obj.get("status")
+        if isinstance(status, dict) and status.get("message"):
+            head = [status["message"]]
+        else:
+            head = [ai_text]
+    groups = _iter_product_groups(obj.get("products"))
+    return head, groups, tail
 
 
 async def _stream_chat_message(session_id: Optional[str], text: str, current_user: dict) -> AsyncGenerator[str, None]:
@@ -1243,16 +1298,19 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         chat_id, 'ai', ai_text,
     )
 
-    message_text, structured = _parse_ai_response(ai_text)
-    product_count = len(structured.get("products", [])) if structured else 0
+    head, groups, tail = _parse_ai_response_parts(ai_text)
+    product_count = sum(len(items) for _, items in groups)
     logger.info(
-        "chat_message: parsed response structured=%s product_count=%d message=%r",
-        bool(structured), product_count, message_text,
+        "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d",
+        len(head), len(groups), product_count, len(tail),
     )
-    yield f"event: message\ndata: {json.dumps({'v': message_text})}\n\n"
-    if structured and structured.get("products"):
-        structured["contentType"] = structured.get("intent") or "product_discovery"
-        yield f"event: product_discovery\ndata: {json.dumps({'v': [structured]})}\n\n"
+    for msg in head:
+        yield f"event: message\ndata: {json.dumps({'v': msg})}\n\n"
+    for _product_type, items in groups:
+        if items:
+            yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
+    for msg in tail:
+        yield f"event: message\ndata: {json.dumps({'v': msg})}\n\n"
 
     yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
     yield f"event: end\ndata: {json.dumps({'v': {}})}\n\n"
