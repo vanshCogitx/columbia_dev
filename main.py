@@ -932,18 +932,25 @@ async def get_chat_history(
                 role="user", content=text, session_id=sid, created_at=_to_iso(created_at),
             ))
         else:
-            message_text, structured = _parse_ai_response(text)
-            has_products = bool(structured and structured.get("products"))
+            head, groups, tail, obj = _parse_ai_response_parts(text)
+            # Only groups that actually have products get a marker + widget —
+            # matches what live streaming does (skips empty groups too).
+            non_empty_groups = [items for _ptype, items in groups if items]
+            has_products = bool(non_empty_groups)
             content_type = None
+            structured_data = None
             if has_products:
-                content_type = structured.get("intent") or "product_discovery"
-                structured["contentType"] = content_type
-            content = (PRODUCT_WIDGET_MARKER + message_text) if has_products else message_text
+                content_type = (obj.get("intent") if obj else None) or "product_discovery"
+                markers = [_product_widget_marker(i) for i in range(1, len(non_empty_groups) + 1)]
+                content = "\n\n".join(head + markers + tail)
+                structured_data = non_empty_groups
+            else:
+                content = "\n\n".join(head + tail) or text
             messages.append(ChatHistoryMessage(
                 role="assistant",
                 content=content,
                 content_type=content_type,
-                structured_data=[structured] if has_products else None,
+                structured_data=structured_data,
                 session_id=sid,
                 created_at=_to_iso(created_at),
             ))
@@ -958,7 +965,12 @@ STATUS_MESSAGES = [
     "Fetching product details...",
     "Looking for deals...",
 ]
-PRODUCT_WIDGET_MARKER = ":::PRODUCT_WIDGET:::"
+def _product_widget_marker(index: int) -> str:
+    """Position marker for the Nth product group in a history message's
+    text, so the frontend can splice each group's widget into the exact
+    spot it belongs (matching structured_data[index - 1]) instead of only
+    ever bundling every group into one widget up front."""
+    return f":::PRODUCT_WIDGET_{index}:::"
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
@@ -1103,32 +1115,6 @@ def _extract_structured_obj(ai_text: str) -> Optional[dict]:
     return obj
 
 
-def _parse_ai_response(ai_text: str) -> tuple[str, Optional[dict]]:
-    """Joins the narrative fields into one display message. Used by chat
-    history replay, where a single past message is rendered as one block.
-    Returns (display_message, structured_object_or_None)."""
-    obj = _extract_structured_obj(ai_text)
-    if obj is None:
-        return ai_text, None
-    message = "\n\n".join(
-        p for p in (
-            obj.get("introduction"),
-            obj.get("orientation"),
-            obj.get("opening"),
-            obj.get("recovery"),
-            obj.get("closing"),
-        ) if p
-    )
-    if not message:
-        # Failure/no-match responses often send opening=null, closing=null —
-        # fall back to the human-readable status.message instead of dumping
-        # the raw JSON blob as the chat message.
-        status = obj.get("status")
-        if isinstance(status, dict) and status.get("message"):
-            message = status["message"]
-    return (message or ai_text), obj
-
-
 def _iter_product_groups(products) -> list[tuple[Optional[str], list]]:
     """Yields (product_type, flat_product_list) pairs so the caller can
     stream each group as its own product_discovery event with a plain
@@ -1152,7 +1138,7 @@ def _iter_product_groups(products) -> list[tuple[Optional[str], list]]:
     return [(None, [p for p in products if isinstance(p, dict)])]
 
 
-def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], list]], list[str]]:
+def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], list]], list[str], Optional[dict]]:
     """Streaming variant of _parse_ai_response: instead of hardcoding which
     field names count as narrative text (introduction/orientation/opening/
     recovery/closing), walks the object's own keys in order and treats any
@@ -1160,11 +1146,13 @@ def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Option
     field from Cartesian is picked up automatically instead of silently
     dropped. 'products' is pulled out separately as product groups;
     'status'/'intent'/'contentType' are metadata, not display text.
-    Returns (head, groups, tail): head = narrative strings that appeared
-    before 'products' in the object, tail = the ones that appeared after."""
+    Returns (head, groups, tail, obj): head = narrative strings that
+    appeared before 'products' in the object, tail = the ones that appeared
+    after, obj = the raw parsed object (None for plain-prose responses) so
+    callers can still pull metadata like 'intent' off it if needed."""
     obj = _extract_structured_obj(ai_text)
     if obj is None:
-        return [ai_text], [], []
+        return [ai_text], [], [], None
     head: list[str] = []
     tail: list[str] = []
     seen_products = False
@@ -1183,7 +1171,7 @@ def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Option
         else:
             head = [ai_text]
     groups = _iter_product_groups(obj.get("products"))
-    return head, groups, tail
+    return head, groups, tail, obj
 
 
 async def _stream_chat_message(session_id: Optional[str], text: str, current_user: dict) -> AsyncGenerator[str, None]:
@@ -1312,7 +1300,7 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         chat_id, 'ai', ai_text,
     )
 
-    head, groups, tail = _parse_ai_response_parts(ai_text)
+    head, groups, tail, _obj = _parse_ai_response_parts(ai_text)
     product_count = sum(len(items) for _, items in groups)
     logger.info(
         "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d",
