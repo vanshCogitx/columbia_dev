@@ -935,7 +935,7 @@ async def get_chat_history(
             head, groups, tail, obj = _parse_ai_response_parts(text)
             # Only groups that actually have products get a marker + widget —
             # matches what live streaming does (skips empty groups too).
-            non_empty_groups = [items for _ptype, items in groups if items]
+            non_empty_groups = [items for _ptype, _title, items in groups if items]
             has_products = bool(non_empty_groups)
             content_type = None
             structured_data = None
@@ -1154,12 +1154,15 @@ def _extract_structured_obj(ai_text: str) -> Optional[dict]:
     return obj
 
 
-def _iter_product_groups(products) -> list[tuple[Optional[str], list]]:
-    """Yields (product_type, flat_product_list) pairs so the caller can
-    stream each group as its own product_discovery event with a plain
-    (non-nested) product array. Handles both the grouped shape
-    ([{"product_type", "products": [...]}, ...]) and an already-flat list
-    of product dicts (e.g. budget intent, post-_flatten_products)."""
+def _iter_product_groups(products) -> list[tuple[Optional[str], Optional[str], list]]:
+    """Yields (product_type, title, flat_product_list) triples so the caller
+    can stream each group as its own product_discovery event with a plain
+    (non-nested) product array. 'title' is the group's display-friendly
+    label (e.g. "Caps" vs the more technical product_type "Cap") — sent
+    separately as a message right before that group's products. Handles
+    both the grouped shape ([{"product_type", "title", "products": [...]},
+    ...]) and an already-flat list of product dicts (e.g. budget intent,
+    post-_flatten_products)."""
     if not isinstance(products, list) or not products:
         return []
     if isinstance(products[0], dict) and isinstance(products[0].get("products"), list):
@@ -1168,16 +1171,17 @@ def _iter_product_groups(products) -> list[tuple[Optional[str], list]]:
             if not isinstance(group, dict):
                 continue
             ptype = group.get("product_type")
+            title = group.get("title")
             items = [p for p in group.get("products", []) if isinstance(p, dict)]
             if ptype:
                 for item in items:
                     item.setdefault("product_type", ptype)
-            groups.append((ptype, items))
+            groups.append((ptype, title, items))
         return groups
-    return [(None, [p for p in products if isinstance(p, dict)])]
+    return [(None, None, [p for p in products if isinstance(p, dict)])]
 
 
-def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], list]], list[str], Optional[dict]]:
+def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], Optional[str], list]], list[str], Optional[dict]]:
     """Streaming variant of _parse_ai_response: instead of hardcoding which
     field names count as narrative text (introduction/orientation/opening/
     recovery/closing), walks the object's own keys in order and treats any
@@ -1246,7 +1250,7 @@ async def _rebuild_session_products_from_db(chat_id: int) -> list[dict]:
     by_id: dict[str, dict] = {}
     for (text,) in rows:
         _head, groups, _tail, _obj = _parse_ai_response_parts(text)
-        for _product_type, items in groups:
+        for _product_type, _title, items in groups:
             for p in items:
                 if p.get("product_id"):
                     by_id[p["product_id"]] = p
@@ -1380,15 +1384,17 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
     )
 
     head, groups, tail, _obj = _parse_ai_response_parts(ai_text)
-    product_count = sum(len(items) for _, items in groups)
+    product_count = sum(len(items) for _, _, items in groups)
     logger.info(
         "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d",
         len(head), len(groups), product_count, len(tail),
     )
     for msg in head:
         yield f"event: message\ndata: {json.dumps({'v': msg})}\n\n"
-    for _product_type, items in groups:
+    for _product_type, title, items in groups:
         if items:
+            if title:
+                yield f"event: message\ndata: {json.dumps({'v': title})}\n\n"
             yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
             await _cache_session_products(session_id, items)
     for msg in tail:
