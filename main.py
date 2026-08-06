@@ -933,17 +933,22 @@ async def get_chat_history(
             ))
         else:
             head, groups, tail, obj = _parse_ai_response_parts(text)
-            # Only groups that actually have products get a marker + widget —
-            # matches what live streaming does (skips empty groups too).
-            non_empty_groups = [items for _ptype, _title, items in groups if items]
+            # Only groups that actually have products get a title + marker +
+            # widget — matches what live streaming does (skips empty groups,
+            # and sends the group's title right before its products).
+            non_empty_groups = [(title, items) for _ptype, title, items in groups if items]
             has_products = bool(non_empty_groups)
             content_type = None
             structured_data = None
             if has_products:
                 content_type = (obj.get("intent") if obj else None) or "product_discovery"
-                markers = [_product_widget_marker(i) for i in range(1, len(non_empty_groups) + 1)]
-                content = "\n\n".join(head + markers + tail)
-                structured_data = non_empty_groups
+                widget_parts = []
+                for i, (title, items) in enumerate(non_empty_groups, start=1):
+                    if title:
+                        widget_parts.append(title)
+                    widget_parts.append(_product_widget_marker(i))
+                content = "\n\n".join(head + widget_parts + tail)
+                structured_data = [items for _title, items in non_empty_groups]
             else:
                 content = "\n\n".join(head + tail) or text
             messages.append(ChatHistoryMessage(
@@ -1394,7 +1399,8 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
     for _product_type, title, items in groups:
         if items:
             if title:
-                yield f"event: message\ndata: {json.dumps({'v': title})}\n\n"
+                title_text = "\n\n" + title
+                yield f"event: message\ndata: {json.dumps({'v': title_text})}\n\n"
             yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
             await _cache_session_products(session_id, items)
     for msg in tail:
