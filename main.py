@@ -958,6 +958,45 @@ async def get_chat_history(
     return ChatHistoryResponse(email=norm_email, messages=messages)
 
 
+class SessionProductsResponse(BaseModel):
+    session_id: str
+    products: List[dict]
+
+
+@app.get(
+    "/api/chats/session-products",
+    response_model=SessionProductsResponse,
+    tags=["chat"],
+    summary="Get all products shown in a chat session",
+    description=(
+        "Returns every product that has been shown (via product_discovery) anywhere in this "
+        "chat session, deduped by product_id — powers the frontend's '@product' popup. Backed by "
+        "a per-session Redis hash cache; on a cache miss it rebuilds from the chat's saved message "
+        "history in Postgres (the real source of truth) and repopulates the cache before returning."
+    )
+)
+async def get_session_products(session_id: str, current_user: dict = Depends(get_current_user)):
+    chat_row = await db_pool.fetchrow(
+        "SELECT id FROM chats WHERE session_id = $1 AND user_id = $2",
+        session_id, current_user["id"],
+    )
+    if not chat_row:
+        raise HTTPException(status_code=404, detail="Chat not found or access denied.")
+
+    key = _session_products_key(session_id)
+    cached = await redis_client.hgetall(key)
+    if cached:
+        products = [json.loads(v) for v in cached.values()]
+        logger.info("session-products: session_id=%s cache hit, %d products", session_id, len(products))
+        return SessionProductsResponse(session_id=session_id, products=products)
+
+    products = await _rebuild_session_products_from_db(chat_row["id"])
+    if products:
+        await _cache_session_products(session_id, products)
+    logger.info("session-products: session_id=%s cache miss, rebuilt %d products from DB", session_id, len(products))
+    return SessionProductsResponse(session_id=session_id, products=products)
+
+
 CARTESIAN_JOB_PATH = "/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs"
 STATUS_MESSAGES = [
     "Thinking...",
@@ -1174,6 +1213,46 @@ def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Option
     return head, groups, tail, obj
 
 
+SESSION_PRODUCTS_TTL_SECONDS = 86400  # cache hygiene only — Postgres (messages table) is the real source of truth
+
+
+def _session_products_key(session_id: str) -> str:
+    return f"session_products:{session_id}"
+
+
+async def _cache_session_products(session_id: str, items: list[dict]) -> None:
+    """Pushes newly-shown products into this session's Redis hash, keyed by
+    product_id so re-showing the same product just overwrites its field
+    instead of creating a duplicate. Refreshes the TTL on every push so an
+    actively-used session's cache doesn't go cold mid-conversation."""
+    mapping = {p["product_id"]: json.dumps(p) for p in items if p.get("product_id")}
+    if not mapping:
+        return
+    key = _session_products_key(session_id)
+    await redis_client.hset(key, mapping=mapping)
+    await redis_client.expire(key, SESSION_PRODUCTS_TTL_SECONDS)
+
+
+async def _rebuild_session_products_from_db(chat_id: int) -> list[dict]:
+    """Cache-miss fallback: replays every AI message ever saved for this
+    chat, re-parsing each one the same way live streaming does, and
+    flattens/dedupes every product group across the whole conversation.
+    Postgres already holds this permanently (messages.text) — Redis is only
+    ever a disposable speed layer in front of it."""
+    rows = await db_pool.fetch(
+        "SELECT text FROM messages WHERE chat_id = $1 AND sender = 'ai' ORDER BY created_at ASC",
+        chat_id,
+    )
+    by_id: dict[str, dict] = {}
+    for (text,) in rows:
+        _head, groups, _tail, _obj = _parse_ai_response_parts(text)
+        for _product_type, items in groups:
+            for p in items:
+                if p.get("product_id"):
+                    by_id[p["product_id"]] = p
+    return list(by_id.values())
+
+
 async def _stream_chat_message(session_id: Optional[str], text: str, current_user: dict) -> AsyncGenerator[str, None]:
     logger.info(
         "chat_message: request received user=%s(%s) session_id=%s text=%r",
@@ -1311,6 +1390,7 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
     for _product_type, items in groups:
         if items:
             yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
+            await _cache_session_products(session_id, items)
     for msg in tail:
         yield f"event: message\ndata: {json.dumps({'v': msg})}\n\n"
 
