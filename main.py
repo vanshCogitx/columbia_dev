@@ -942,15 +942,19 @@ async def get_chat_history(
             structured_data = None
             if has_products:
                 content_type = (obj.get("intent") if obj else None) or "product_discovery"
-                widget_parts = []
+                parts = []
+                if head:
+                    parts.append(" ".join(head))
                 for i, (title, items) in enumerate(non_empty_groups, start=1):
                     if title:
-                        widget_parts.append(f"**{title}**")
-                    widget_parts.append(_product_widget_marker(i))
-                content = "\n\n".join(head + widget_parts + tail)
+                        parts.append(f"**{title}**")
+                    parts.append(_product_widget_marker(i))
+                if tail:
+                    parts.append(" ".join(tail))
+                content = "\n\n".join(parts)
                 structured_data = [items for _title, items in non_empty_groups]
             else:
-                content = "\n\n".join(head + tail) or text
+                content = " ".join(head + tail) or text
             messages.append(ChatHistoryMessage(
                 role="assistant",
                 content=content,
@@ -1395,7 +1399,7 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         len(head), len(groups), product_count, len(tail),
     )
     if head:
-        head_text = "\n\n".join(head)
+        head_text = " ".join(head)
         yield f"event: message\ndata: {json.dumps({'v': head_text})}\n\n"
     for _product_type, title, items in groups:
         if items:
@@ -1405,7 +1409,7 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
             yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
             await _cache_session_products(session_id, items)
     if tail:
-        tail_text = "\n\n".join(tail)
+        tail_text = " ".join(tail)
         yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
 
     yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
