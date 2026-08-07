@@ -945,7 +945,7 @@ async def get_chat_history(
                 widget_parts = []
                 for i, (title, items) in enumerate(non_empty_groups, start=1):
                     if title:
-                        widget_parts.append(title)
+                        widget_parts.append(f"**{title}**")
                     widget_parts.append(_product_widget_marker(i))
                 content = "\n\n".join(head + widget_parts + tail)
                 structured_data = [items for _title, items in non_empty_groups]
@@ -1394,17 +1394,19 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d",
         len(head), len(groups), product_count, len(tail),
     )
-    for msg in head:
-        yield f"event: message\ndata: {json.dumps({'v': msg})}\n\n"
+    if head:
+        head_text = "\n\n".join(head)
+        yield f"event: message\ndata: {json.dumps({'v': head_text})}\n\n"
     for _product_type, title, items in groups:
         if items:
             if title:
-                title_text = "\n\n" + title
+                title_text = f"\n\n**{title}**"
                 yield f"event: message\ndata: {json.dumps({'v': title_text})}\n\n"
             yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
             await _cache_session_products(session_id, items)
-    for msg in tail:
-        yield f"event: message\ndata: {json.dumps({'v': msg})}\n\n"
+    if tail:
+        tail_text = "\n\n".join(tail)
+        yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
 
     yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
     yield f"event: end\ndata: {json.dumps({'v': {}})}\n\n"
