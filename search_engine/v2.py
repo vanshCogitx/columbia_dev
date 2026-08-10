@@ -23,9 +23,10 @@ class CatalogSearchEngineV2:
     Uses the same Gemma embedding model as the existing ProductSearchEngine.
     """
 
-    def __init__(self):
+    def __init__(self, index_name: str = None):
         self.pc = None
         self.index = None
+        self.index_name = index_name or PINECONE_CATALOG_INDEX_NAME
 
     def load_data(self):
         """Establish connection to the flat catalog Pinecone index."""
@@ -35,17 +36,17 @@ class CatalogSearchEngineV2:
             )
             return
 
-        logger.info(f"Connecting to Pinecone catalog index: '{PINECONE_CATALOG_INDEX_NAME}'...")
+        logger.info(f"Connecting to Pinecone catalog index: '{self.index_name}'...")
         try:
             self.pc = Pinecone(api_key=PINECONE_API_KEY)
             active_indexes = [idx.name for idx in self.pc.list_indexes()]
-            if PINECONE_CATALOG_INDEX_NAME not in active_indexes:
+            if self.index_name not in active_indexes:
                 logger.warning(
-                    f"WARNING: Pinecone index '{PINECONE_CATALOG_INDEX_NAME}' does not exist. "
-                    "Please run ingest_catalog_v2.py first."
+                    f"WARNING: Pinecone index '{self.index_name}' does not exist. "
+                    "Please run the matching ingestion script first."
                 )
             else:
-                self.index = self.pc.Index(PINECONE_CATALOG_INDEX_NAME)
+                self.index = self.pc.Index(self.index_name)
                 logger.info("CatalogSearchEngineV2: Pinecone index connected successfully!")
         except Exception as e:
             logger.error(f"ERROR: Failed to connect to Pinecone catalog index: {e}")

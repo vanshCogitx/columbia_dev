@@ -24,6 +24,12 @@ engine = ProductSearchEngine()
 # Flat catalog search engine (pure Pinecone, no DB)
 catalog_engine_v2 = CatalogSearchEngineV2()
 
+# V3: same engine class, pointed at the corrected-catalog index — kept
+# separate from v2 on purpose so v2's results stay unchanged.
+catalog_engine_v3 = CatalogSearchEngineV2(
+    index_name=os.getenv("PINECONE_CATALOG_V3_INDEX_NAME", "columbia-catalog-v3")
+)
+
 # Global Postgres (Supabase) connection pool, set during lifespan startup
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -216,6 +222,7 @@ async def lifespan(app: FastAPI):
         engine.pool = db_pool
         engine.load_data()
         catalog_engine_v2.load_data()
+        catalog_engine_v3.load_data()
 
         redis_client = redis_asyncio.Redis(
             host=os.getenv("REDIS_HOST"),

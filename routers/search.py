@@ -107,11 +107,12 @@ async def search_products_v2(request: CatalogSearchRequestV2 = Body(...)):
     tags=["search tools"],
     summary="Batched flat catalog semantic search (V3)",
     description=(
-        "Batched version of search-products-v2 — accepts multiple independent queries in a "
-        "single call and returns one result list per query, in the same order they were sent. "
-        "Each query supports the same fields as V2 (a natural language 'query' plus optional "
-        "structured filters). Queries run concurrently; if one query fails, only that query's "
-        "slot comes back as an empty list — the rest of the batch still returns normally."
+        "Batched version of search-products-v2, but searches the corrected product catalog "
+        "(a separate Pinecone index from V2 — results may differ). Accepts multiple independent "
+        "queries in a single call and returns one result list per query, in the same order they "
+        "were sent. Each query supports the same fields as V2 (a natural language 'query' plus "
+        "optional structured filters). Queries run concurrently; if one query fails, only that "
+        "query's slot comes back as an empty list — the rest of the batch still returns normally."
     )
 )
 async def search_products_v3(request: CatalogSearchRequestV3 = Body(...)):
@@ -119,7 +120,7 @@ async def search_products_v3(request: CatalogSearchRequestV3 = Body(...)):
 
     async def _run_one(q: CatalogSearchRequestV2, index: int) -> list:
         try:
-            results = await db.catalog_engine_v2.search(
+            results = await db.catalog_engine_v3.search(
                 query=q.query,
                 category_level_1=q.category_level_1,
                 category_level_2=q.category_level_2,
