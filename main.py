@@ -512,6 +512,17 @@ class CatalogSearchRequestV2(BaseModel):
         description="Maximum number of products to return (default 10)."
     )
 
+class CatalogSearchRequestV3(BaseModel):
+    queries: List[CatalogSearchRequestV2] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "A batch of independent search queries, each supporting the same fields as "
+            "search-products-v2 (natural language 'query' plus optional structured filters). "
+            "Queries run concurrently and independently."
+        )
+    )
+
 class CatalogProductResultV2(BaseModel):
     product_id: str = Field(..., description="Unique SKU / product ID.")
     name: str = Field(..., description="Full product name.")
@@ -615,6 +626,50 @@ async def search_products_v2(request: CatalogSearchRequestV2 = Body(...)):
     except Exception as e:
         logger.error("TOOL search-products-v2: failed: %s", e)
         raise HTTPException(status_code=500, detail=f"V2 search failed: {str(e)}")
+
+
+@app.post(
+    "/tools/search-products-v3",
+    response_model=List[List[CatalogProductResultV2]],
+    dependencies=[Depends(verify_api_key)],
+    tags=["search tools"],
+    summary="Batched flat catalog semantic search (V3)",
+    description=(
+        "Batched version of search-products-v2 — accepts multiple independent queries in a "
+        "single call and returns one result list per query, in the same order they were sent. "
+        "Each query supports the same fields as V2 (a natural language 'query' plus optional "
+        "structured filters). Queries run concurrently; if one query fails, only that query's "
+        "slot comes back as an empty list — the rest of the batch still returns normally."
+    )
+)
+async def search_products_v3(request: CatalogSearchRequestV3 = Body(...)):
+    logger.info("TOOL search-products-v3: %d queries", len(request.queries))
+
+    async def _run_one(q: CatalogSearchRequestV2, index: int) -> list:
+        try:
+            results = await catalog_engine_v2.search(
+                query=q.query,
+                category_level_1=q.category_level_1,
+                category_level_2=q.category_level_2,
+                product_type=q.product_type,
+                sport=q.sport,
+                price_min=q.price_min,
+                price_max=q.price_max,
+                color=q.color,
+                size=q.size,
+                top_k=q.top_k,
+            )
+            logger.info(
+                "TOOL search-products-v3: query[%d] %d products returned: %s",
+                index, len(results), [r["product_id"] for r in results],
+            )
+            return results
+        except Exception as e:
+            logger.error("TOOL search-products-v3: query[%d] failed: %s", index, e)
+            return []
+
+    all_results = await asyncio.gather(*(_run_one(q, i) for i, q in enumerate(request.queries)))
+    return list(all_results)
 
 
 @app.get(
