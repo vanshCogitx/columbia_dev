@@ -1,0 +1,418 @@
+import os
+import uuid
+import json
+import re
+import random
+import asyncio
+import logging
+from typing import AsyncGenerator, Optional
+
+import httpx
+
+import db
+
+logger = logging.getLogger("columbia_backend")
+
+CARTESIAN_JOB_PATH = "/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs"
+STATUS_MESSAGES = [
+    "Thinking...",
+    "Searching the catalog...",
+    "Fetching product details...",
+    "Looking for deals...",
+]
+
+
+def _product_widget_marker(index: int) -> str:
+    """Position marker for the Nth product group in a history message's
+    text, so the frontend can splice each group's widget into the exact
+    spot it belongs (matching structured_data[index - 1]) instead of only
+    ever bundling every group into one widget up front."""
+    return f":::PRODUCT_WIDGET_{index}:::"
+
+
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
+_NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType"}
+
+
+def _extract_ai_text(output_obj: dict) -> Optional[str]:
+    """variables.text is the clean, flat JSON string matching the intent's
+    schema. workflow_response.content is sometimes a nested dict (e.g.
+    {"result": {...fields double-encoded...}}) rather than a string, which
+    breaks downstream str-only consumers (DB insert, _parse_ai_response).
+    Prefer text; only fall back to content if it's actually a string."""
+    text = output_obj.get("variables", {}).get("text")
+    if isinstance(text, str):
+        return text
+    content = output_obj.get("workflow_response", {}).get("content")
+    if isinstance(content, str):
+        return content
+    return None
+
+
+async def _call_cartesian_workflow(client: httpx.AsyncClient, url: str, poll_url_base: str, params: dict, payload: dict, headers: dict) -> Optional[str]:
+    """Runs the full Cartesian call (initial POST, then the poll loop if the
+    job was accepted for async processing). Returns the extracted ai_text,
+    or None if nothing usable came back. Runs as a background task so the
+    caller can tick status messages independently of this function's cadence."""
+    response = await client.post(url, json=payload, params=params, headers=headers, timeout=40)
+    response.raise_for_status()
+    data = response.json()
+    logger.info("cartesian: initial response status=%s body=%s", response.status_code, data)
+    resp_data = data.get("data", data)
+
+    if resp_data.get("ok") and resp_data.get("accepted"):
+        run_id = resp_data.get("runId")
+        poll_url = f"{poll_url_base}/{run_id}"
+        logger.info("cartesian: job accepted async, runId=%s, polling %s", run_id, poll_url)
+        max_retries = 30
+        for attempt in range(max_retries):
+            await asyncio.sleep(2)
+            poll_resp = await client.get(poll_url, headers=headers, timeout=10)
+            poll_resp.raise_for_status()
+            poll_data_raw = poll_resp.json()
+            poll_data = poll_data_raw.get("data", poll_data_raw)
+            logger.info(
+                "cartesian: poll attempt %d/%d isCompleted=%s body=%s",
+                attempt + 1, max_retries, poll_data.get("isCompleted"), poll_data_raw,
+            )
+            if poll_data.get("isCompleted"):
+                return _extract_ai_text(poll_data.get("output", {}))
+        logger.error("cartesian: timed out after %d poll attempts", max_retries)
+        return None
+
+    if resp_data.get("ok") and not resp_data.get("accepted"):
+        logger.info("cartesian: completed synchronously within wait window")
+        return _extract_ai_text(resp_data.get("output", {}))
+
+    logger.error("cartesian: no ai_text extractable from response: %s", data)
+    return None
+
+
+_PRODUCT_ARRAY_STRING_FIELDS = (
+    "available_colors", "available_sizes", "available_materials",
+    "available_features", "available_fits", "tags",
+)
+
+
+def _coerce_products_list(structured: dict) -> None:
+    """Cartesian sometimes double-encodes 'products' as a JSON string instead
+    of a real array. Parse it in place so _flatten_products/_normalize_product_arrays
+    (which both require an actual list) don't silently no-op on it."""
+    products = structured.get("products")
+    if isinstance(products, str):
+        try:
+            parsed = json.loads(products)
+        except json.JSONDecodeError:
+            return
+        if isinstance(parsed, list):
+            structured["products"] = parsed
+
+
+def _flatten_products(structured: dict) -> None:
+    """Every intent except 'budget' sends products as a flat list of product
+    dicts. 'budget' wraps them one level deeper as [{query, items:[...]}, ...].
+    Flatten that here so the frontend's product grid renderer never has to
+    branch on intent."""
+    products = structured.get("products")
+    if not isinstance(products, list) or not products:
+        return
+    if isinstance(products[0], dict) and "items" in products[0]:
+        flat = []
+        for group in products:
+            if isinstance(group, dict) and isinstance(group.get("items"), list):
+                flat.extend(item for item in group["items"] if isinstance(item, dict))
+        structured["products"] = flat
+
+
+def _normalize_product_arrays(structured: dict) -> None:
+    """Cartesian sends list-shaped fields (colors, sizes, tags, ...) as a
+    stringified JSON array (e.g. '["Black", "Blue"]') instead of a real array.
+    Parse those in place so the frontend gets actual arrays."""
+    for product in structured.get("products") or []:
+        if not isinstance(product, dict):
+            continue
+        for field in _PRODUCT_ARRAY_STRING_FIELDS:
+            value = product.get(field)
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, list):
+                    product[field] = parsed
+
+
+def _extract_structured_obj(ai_text: str) -> Optional[dict]:
+    """Parses ai_text (optionally ```json-fenced) into the structured dict
+    Cartesian sends for product replies ({"introduction","orientation",
+    "opening","status","products","recovery","closing"}), normalizing the
+    products field in place. Returns None for plain prose or anything that
+    isn't a JSON object."""
+    candidate = ai_text.strip()
+    fence_match = _CODE_FENCE_RE.search(candidate)
+    if fence_match:
+        candidate = fence_match.group(1).strip()
+    try:
+        obj = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    _coerce_products_list(obj)
+    _flatten_products(obj)
+    _normalize_product_arrays(obj)
+    return obj
+
+
+def _iter_product_groups(products) -> list[tuple[Optional[str], Optional[str], list]]:
+    """Yields (product_type, title, flat_product_list) triples so the caller
+    can stream each group as its own product_discovery event with a plain
+    (non-nested) product array. 'title' is the group's display-friendly
+    label (e.g. "Caps" vs the more technical product_type "Cap") — sent
+    separately as a message right before that group's products. Handles
+    both the grouped shape ([{"product_type", "title", "products": [...]},
+    ...]) and an already-flat list of product dicts (e.g. budget intent,
+    post-_flatten_products)."""
+    if not isinstance(products, list) or not products:
+        return []
+    if isinstance(products[0], dict) and isinstance(products[0].get("products"), list):
+        groups = []
+        for group in products:
+            if not isinstance(group, dict):
+                continue
+            ptype = group.get("product_type")
+            title = group.get("title")
+            items = [p for p in group.get("products", []) if isinstance(p, dict)]
+            if ptype:
+                for item in items:
+                    item.setdefault("product_type", ptype)
+            groups.append((ptype, title, items))
+        return groups
+    return [(None, None, [p for p in products if isinstance(p, dict)])]
+
+
+def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], Optional[str], list]], list[str], Optional[dict]]:
+    """Streaming variant of _parse_ai_response: instead of hardcoding which
+    field names count as narrative text (introduction/orientation/opening/
+    recovery/closing), walks the object's own keys in order and treats any
+    non-empty string value as a message — so a new or renamed narrative
+    field from Cartesian is picked up automatically instead of silently
+    dropped. 'products' is pulled out separately as product groups;
+    'status'/'intent'/'contentType' are metadata, not display text.
+    Returns (head, groups, tail, obj): head = narrative strings that
+    appeared before 'products' in the object, tail = the ones that appeared
+    after, obj = the raw parsed object (None for plain-prose responses) so
+    callers can still pull metadata like 'intent' off it if needed."""
+    obj = _extract_structured_obj(ai_text)
+    if obj is None:
+        return [ai_text], [], [], None
+    head: list[str] = []
+    tail: list[str] = []
+    seen_products = False
+    for key, value in obj.items():
+        if key == "products":
+            seen_products = True
+            continue
+        if key in _NON_NARRATIVE_KEYS:
+            continue
+        if isinstance(value, str) and value:
+            (tail if seen_products else head).append(value)
+    if not head and not tail:
+        status = obj.get("status")
+        if isinstance(status, dict) and status.get("message"):
+            head = [status["message"]]
+        else:
+            head = [ai_text]
+    groups = _iter_product_groups(obj.get("products"))
+    return head, groups, tail, obj
+
+
+SESSION_PRODUCTS_TTL_SECONDS = 86400  # cache hygiene only — Postgres (messages table) is the real source of truth
+
+
+def _session_products_key(session_id: str) -> str:
+    return f"session_products:{session_id}"
+
+
+async def _cache_session_products(session_id: str, items: list[dict]) -> None:
+    """Pushes newly-shown products into this session's Redis hash, keyed by
+    product_id so re-showing the same product just overwrites its field
+    instead of creating a duplicate. Refreshes the TTL on every push so an
+    actively-used session's cache doesn't go cold mid-conversation."""
+    mapping = {p["product_id"]: json.dumps(p) for p in items if p.get("product_id")}
+    if not mapping:
+        return
+    key = _session_products_key(session_id)
+    await db.redis_client.hset(key, mapping=mapping)
+    await db.redis_client.expire(key, SESSION_PRODUCTS_TTL_SECONDS)
+
+
+async def _rebuild_session_products_from_db(chat_id: int) -> list[dict]:
+    """Cache-miss fallback: replays every AI message ever saved for this
+    chat, re-parsing each one the same way live streaming does, and
+    flattens/dedupes every product group across the whole conversation.
+    Postgres already holds this permanently (messages.text) — Redis is only
+    ever a disposable speed layer in front of it."""
+    rows = await db.db_pool.fetch(
+        "SELECT text FROM messages WHERE chat_id = $1 AND sender = 'ai' ORDER BY created_at ASC",
+        chat_id,
+    )
+    by_id: dict[str, dict] = {}
+    for (text,) in rows:
+        _head, groups, _tail, _obj = _parse_ai_response_parts(text)
+        for _product_type, _title, items in groups:
+            for p in items:
+                if p.get("product_id"):
+                    by_id[p["product_id"]] = p
+    return list(by_id.values())
+
+
+async def _stream_chat_message(session_id: Optional[str], text: str, current_user: dict) -> AsyncGenerator[str, None]:
+    logger.info(
+        "chat_message: request received user=%s(%s) session_id=%s text=%r",
+        current_user["email"], current_user["id"], session_id, text,
+    )
+    # 1. Resolve chat: create one if session_id omitted, else verify ownership
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+        title = "New Chat"
+        row = await db.db_pool.fetchrow(
+            "INSERT INTO chats (user_id, session_id, title) VALUES ($1, $2, $3) RETURNING id",
+            current_user["id"], session_id, title,
+        )
+        chat_id = row["id"]
+        logger.info("chat_message: created new chat_id=%s session_id=%s", chat_id, session_id)
+    else:
+        chat_row = await db.db_pool.fetchrow(
+            "SELECT id, title FROM chats WHERE session_id = $1 AND user_id = $2",
+            session_id, current_user["id"],
+        )
+        if not chat_row:
+            logger.warning("chat_message: session_id=%s not found for user_id=%s", session_id, current_user["id"])
+            yield f"event: error\ndata: {json.dumps({'detail': 'Chat not found or access denied.'})}\n\n"
+            return
+        chat_id, title = chat_row["id"], chat_row["title"]
+        logger.info("chat_message: continuing chat_id=%s session_id=%s", chat_id, session_id)
+
+    yield f"event: chat\ndata: {json.dumps({'v': {'id': chat_id, 'session_id': session_id, 'title': title}})}\n\n"
+
+    # 2. Save user message
+    user_msg_row = await db.db_pool.fetchrow(
+        "INSERT INTO messages (chat_id, sender, text) VALUES ($1, $2, $3) RETURNING id",
+        chat_id, 'user', text,
+    )
+    user_msg_id = user_msg_row["id"]
+
+    # 3. Auto-title from first message
+    if title == "New Chat":
+        new_title = text[:40] + ("..." if len(text) > 40 else "")
+        await db.db_pool.execute("UPDATE chats SET title = $1 WHERE id = $2", new_title, chat_id)
+
+    # 4. Compile history + profile into the prompt sent to Cartesian
+    history_rows = await db.db_pool.fetch(
+        "SELECT sender, text FROM messages WHERE chat_id = $1 AND id < $2 ORDER BY created_at ASC",
+        chat_id, user_msg_id,
+    )
+    profile_header = f"--- User Profile ---\n- Name: {current_user['name']}\n\n"
+    if history_rows:
+        history_str = "\n".join(
+            f"[{'User' if sender == 'user' else 'AI'}]: {msg}" for sender, msg in history_rows
+        )
+        history_block = f"--- Chat History ---\n{history_str}\n\n"
+    else:
+        history_block = ""
+    compiled_text = (
+        "System Instruction: Below is the context of the logged-in user and the chat history of this conversation. "
+        "Please use this information to answer the user's latest query at the end. "
+        "Respond ONLY to the latest query and do not repeat the context or history.\n\n"
+        f"{profile_header}{history_block}"
+        f"--- Latest User Query ---\n[User]: {text}"
+    )
+    logger.info("chat_message: compiled prompt (%d chars): %r", len(compiled_text), compiled_text)
+
+    # 5. Call Cartesian workflow, streaming status ticks while we wait
+    base_url = os.getenv("CARTESIAN_BASE_URL", "https://api.cartesian.ai")
+    client_id = os.getenv("CARTESIAN_CLIENT_ID")
+    client_secret = os.getenv("CARTESIAN_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        logger.error("chat_message: Cartesian API credentials missing in environment")
+        yield f"event: error\ndata: {json.dumps({'detail': 'Cartesian API credentials are missing.'})}\n\n"
+        return
+
+    headers = {
+        "x-client-id": client_id,
+        "x-client-secret": client_secret,
+        "Content-Type": "application/json",
+    }
+    params = {"waitSeconds": 30, "sessionId": session_id}
+    payload = {"payload": {"user_query": compiled_text, "user_id": current_user["email"]}}
+    url = f"{base_url.rstrip('/')}{CARTESIAN_JOB_PATH}"
+
+    ai_text: Optional[str] = None
+    yield f"event: status\ndata: {json.dumps({'v': random.choice(STATUS_MESSAGES)})}\n\n"
+
+    logger.info("cartesian: POST %s params=%s", url, params)
+
+    async with httpx.AsyncClient() as client:
+        poll_url_base = f"{base_url.rstrip('/')}{CARTESIAN_JOB_PATH}"
+        task = asyncio.create_task(
+            _call_cartesian_workflow(client, url, poll_url_base, params, payload, headers)
+        )
+
+        # Status ticks run on their own 3-5s cadence, fully decoupled from
+        # whatever Cartesian is doing internally (sync wait or async polling)
+        # so the frontend always sees continuous progress regardless of path.
+        shuffled = random.sample(STATUS_MESSAGES, len(STATUS_MESSAGES))
+        tick_idx = 0
+        try:
+            while not task.done():
+                done, _ = await asyncio.wait({task}, timeout=random.uniform(3, 5))
+                if task in done:
+                    break
+                yield f"event: status\ndata: {json.dumps({'v': shuffled[tick_idx % len(shuffled)]})}\n\n"
+                tick_idx += 1
+                if tick_idx % len(shuffled) == 0:
+                    shuffled = random.sample(STATUS_MESSAGES, len(STATUS_MESSAGES))
+
+            ai_text = await task
+        except httpx.HTTPError as e:
+            logger.error("cartesian: HTTP error communicating with Cartesian: %s", e)
+            yield f"event: error\ndata: {json.dumps({'detail': f'AI service communication error: {str(e)}'})}\n\n"
+            return
+
+    if ai_text is None:
+        logger.error("cartesian: no ai_text extractable from response")
+        yield f"event: error\ndata: {json.dumps({'detail': 'Unexpected response from the AI service.'})}\n\n"
+        return
+
+    logger.info("cartesian: extracted ai_text (%d chars): %r", len(ai_text), ai_text)
+
+    # 6. Save AI response, then stream it out
+    await db.db_pool.execute(
+        "INSERT INTO messages (chat_id, sender, text) VALUES ($1, $2, $3)",
+        chat_id, 'ai', ai_text,
+    )
+
+    head, groups, tail, _obj = _parse_ai_response_parts(ai_text)
+    product_count = sum(len(items) for _, _, items in groups)
+    logger.info(
+        "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d",
+        len(head), len(groups), product_count, len(tail),
+    )
+    if head:
+        head_text = " ".join(head)
+        yield f"event: message\ndata: {json.dumps({'v': head_text})}\n\n"
+    for _product_type, title, items in groups:
+        if items:
+            if title:
+                title_text = f"\n\n**{title}**"
+                yield f"event: message\ndata: {json.dumps({'v': title_text})}\n\n"
+            yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
+            await _cache_session_products(session_id, items)
+    if tail:
+        tail_text = " ".join(tail)
+        yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
+
+    yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
+    yield f"event: end\ndata: {json.dumps({'v': {}})}\n\n"
+    logger.info("chat_message: stream complete chat_id=%s session_id=%s", chat_id, session_id)

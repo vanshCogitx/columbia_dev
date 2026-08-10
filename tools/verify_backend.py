@@ -2,10 +2,14 @@ import os
 import sys
 import sqlite3
 
+# search_engine/ lives at the repo root, one level up from this tools/ directory —
+# add it to sys.path so this still works when run directly (python tools/verify_backend.py)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 def run_tests():
     print("=== Testing Columbia Inventory Search Engine (Dual-DB SQLite + Pinecone) ===")
     try:
-        from search_engine import ProductSearchEngine
+        from search_engine.v1 import ProductSearchEngine
     except ImportError as e:
         print(f"Error importing ProductSearchEngine: {e}")
         sys.exit(1)
