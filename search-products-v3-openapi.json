@@ -1,0 +1,145 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Columbia Product Search API (Batched)",
+    "version": "1.0.0",
+    "description": "Batched semantic search over the corrected Columbia product catalog. Accepts multiple independent queries in a single call — use this instead of calling search_products multiple times when you need results for more than one product category or intent in the same turn, to stay within tool-call limits."
+  },
+  "servers": [
+    {
+      "url": "https://columbia-dev.onrender.com",
+      "description": "Dev server"
+    }
+  ],
+  "paths": {
+    "/tools/search-products-v3": {
+      "post": {
+        "summary": "Search Columbia products (batched, multiple queries per call)",
+        "description": "Runs multiple independent product searches concurrently in a single call and returns one result list per query, in the same order they were sent. Each query supports the same fields as a single search (natural language query plus optional structured filters). If one query in the batch fails, only that query's slot comes back as an empty list — the rest of the batch still returns normally.",
+        "operationId": "search_products_batch",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["queries"],
+                "properties": {
+                  "queries": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "A batch of independent search queries, each supporting the same fields as a single search. Queries run concurrently and independently — put every product category or intent you need for this turn into one call here instead of making separate calls.",
+                    "items": {
+                      "type": "object",
+                      "required": ["query"],
+                      "properties": {
+                        "query": {
+                          "type": "string",
+                          "description": "A natural language search query describing what the user is looking for, e.g. 'waterproof hiking jacket in blue', 'kids fleece jacket', 'trekking poles'. Always required — all retrieval is semantic."
+                        },
+                        "category_level_1": {
+                          "type": "string",
+                          "description": "Primary department or category filter (e.g., 'Apparel', 'Accessories', 'Bags & Gear')."
+                        },
+                        "category_level_2": {
+                          "type": "string",
+                          "description": "Secondary category / demographic filter (e.g., \"Men's\", \"Women's\", 'Kids', 'Unisex')."
+                        },
+                        "product_type": {
+                          "type": "string",
+                          "description": "Product type filter (e.g., 'Sportswear', 'Equipment', 'Accessories')."
+                        },
+                        "sport": {
+                          "type": "string",
+                          "description": "Sport or activity filter (e.g., 'Hiking', 'Casual', 'Running')."
+                        },
+                        "price_min": {
+                          "type": "number",
+                          "description": "Minimum price filter (inclusive). Products priced below this value are excluded."
+                        },
+                        "price_max": {
+                          "type": "number",
+                          "description": "Maximum price filter (inclusive). Products priced above this value are excluded."
+                        },
+                        "color": {
+                          "type": "string",
+                          "description": "Exact color filter (e.g., 'Black', 'Blue', 'Maroon')."
+                        },
+                        "size": {
+                          "type": "string",
+                          "description": "Exact size filter (e.g., 'S', 'M', 'L', 'XL', 'XXS', 'OS')."
+                        },
+                        "top_k": {
+                          "type": "integer",
+                          "default": 10,
+                          "description": "Maximum number of products to return for this query (default 10)."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "One result list per query, in the same order the queries were submitted. A query that failed comes back as an empty array in its slot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "description": "Outer array — one entry per query submitted, same order as the request.",
+                  "items": {
+                    "type": "array",
+                    "description": "Matching products for this query.",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "product_id": { "type": "string", "description": "Unique SKU / product ID." },
+                        "name": { "type": "string", "description": "Full product name." },
+                        "price": { "type": "number", "description": "Product price." },
+                        "category_level_1": { "type": "string", "description": "Primary department/category." },
+                        "category_level_2": { "type": "string", "description": "Secondary category/demographic." },
+                        "product_type": { "type": "string", "description": "Product type classification." },
+                        "sport": { "type": "string", "description": "Sport or activity." },
+                        "color": { "type": "string", "description": "Product color." },
+                        "material": { "type": "string", "description": "Product material." },
+                        "fit": { "type": "string", "description": "Fit style (e.g., Regular, Slim, Comfort Stretch)." },
+                        "features": { "type": "string", "description": "Key product features." },
+                        "size": { "type": "string", "description": "Available size for this SKU." },
+                        "stock_quantity": { "type": "integer", "description": "Units currently in stock." },
+                        "availability": { "type": "string", "description": "'in_stock' or 'out_of_stock'." },
+                        "url": { "type": "string", "description": "Product detail page URL." },
+                        "image_url": { "type": "string", "description": "Product image URL." },
+                        "description_snippet": { "type": "string", "description": "Short description excerpt." },
+                        "score": { "type": "number", "description": "Semantic similarity score (cosine, 0–1)." }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation error (e.g. 'queries' is empty or missing)."
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "APIKeyHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
+      }
+    }
+  }
+}
