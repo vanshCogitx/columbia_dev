@@ -50,6 +50,8 @@ class ChatHistoryMessage(BaseModel):
 class ChatHistoryResponse(BaseModel):
     email: str
     messages: List[ChatHistoryMessage]
+    pending: Optional[bool] = None
+    pending_status: Optional[str] = None
 
 class ChatMessageRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Existing chat's session_id. Omit to start a new chat.")

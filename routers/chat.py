@@ -258,8 +258,18 @@ async def get_chat_history(
                 session_id=sid,
                 created_at=_to_iso(created_at),
             ))
+    # Only meaningful when scoped to one chat (session_id given) — a single
+    # boolean can't represent "pending" across several chats at once, so we
+    # leave it unset (None) for the "every chat this user has" case.
+    pending = None
+    pending_status = None
+    if session_id and chat_ids:
+        pending = await cartesian.is_response_pending(chat_ids[0])
+        if pending:
+            pending_status = await cartesian.get_pending_status(chat_ids[0])
+
     logger.info("chat_history: email=%s session_id=%s returned %d messages", norm_email, session_id, len(messages))
-    return ChatHistoryResponse(email=norm_email, messages=messages)
+    return ChatHistoryResponse(email=norm_email, messages=messages, pending=pending, pending_status=pending_status)
 
 
 @router.get(

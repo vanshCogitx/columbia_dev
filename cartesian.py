@@ -4,6 +4,7 @@ import json
 import re
 import random
 import asyncio
+import contextlib
 import logging
 from typing import AsyncGenerator, Optional
 
@@ -301,6 +302,161 @@ async def _rebuild_session_products_from_db(chat_id: int) -> list[dict]:
     return list(by_id.values())
 
 
+PENDING_RESPONSE_TTL_SECONDS = 300  # safety-net expiry only, in case the process dies before the finally block runs
+
+
+def _pending_response_key(chat_id: int) -> str:
+    return f"chat_pending:{chat_id}"
+
+
+async def is_response_pending(chat_id: int) -> bool:
+    """Whether a background _generate_and_save_response task is currently
+    in flight for this chat — lets a client reopening a chat mid-generation
+    tell 'still working on it' apart from 'this just has no reply'."""
+    return bool(await db.redis_client.exists(_pending_response_key(chat_id)))
+
+
+def _pending_status_key(chat_id: int) -> str:
+    return f"chat_status:{chat_id}"
+
+
+async def get_pending_status(chat_id: int) -> Optional[str]:
+    """Current rotating status phrase (e.g. 'Searching the catalog...') for an
+    in-flight response, written by _status_ticker. Lets a client that reopens
+    a chat mid-generation show the same live-feeling status text a connected
+    SSE stream would have shown, instead of a generic 'loading' spinner."""
+    return await db.redis_client.get(_pending_status_key(chat_id))
+
+
+async def _status_ticker(chat_id: int) -> None:
+    """Rotates through STATUS_MESSAGES into Redis every 3-5s for as long as
+    it runs. Started alongside _generate_and_save_response and cancelled in
+    its finally block — deliberately decoupled from any client connection,
+    so both a live _stream_chat_message viewer and a client polling
+    /api/chats/history after reconnecting read the exact same rotating text
+    from here rather than each keeping their own independently-random copy."""
+    status_key = _pending_status_key(chat_id)
+    shuffled = random.sample(STATUS_MESSAGES, len(STATUS_MESSAGES))
+    idx = 0
+    while True:
+        await db.redis_client.setex(status_key, PENDING_RESPONSE_TTL_SECONDS, shuffled[idx % len(shuffled)])
+        idx += 1
+        if idx % len(shuffled) == 0:
+            shuffled = random.sample(STATUS_MESSAGES, len(STATUS_MESSAGES))
+        await asyncio.sleep(random.uniform(3, 5))
+
+
+async def _generate_and_save_response(
+    chat_id: int, session_id: str, title: str, text: str, current_user: dict
+) -> dict:
+    """Does all of the real work for one turn: saves the user message, calls
+    the Cartesian workflow, parses the response, and saves it. Deliberately
+    NOT a generator and NOT tied to the client's HTTP connection — it's run
+    as an independent asyncio task by _stream_chat_message (see there for
+    why: a client disconnecting mid-request — tab switch, backgrounding,
+    network blip — must not abandon an in-flight response partway through).
+    Returns {"error": str} on failure, or {"head", "groups", "tail"} on
+    success, for the caller to turn into SSE events."""
+    pending_key = _pending_response_key(chat_id)
+    status_key = _pending_status_key(chat_id)
+    await db.redis_client.setex(pending_key, PENDING_RESPONSE_TTL_SECONDS, "1")
+    ticker_task = asyncio.create_task(_status_ticker(chat_id))
+    try:
+        # 2. Save user message
+        user_msg_row = await db.db_pool.fetchrow(
+            "INSERT INTO messages (chat_id, sender, text) VALUES ($1, $2, $3) RETURNING id",
+            chat_id, 'user', text,
+        )
+        user_msg_id = user_msg_row["id"]
+
+        # 3. Auto-title from first message
+        if title == "New Chat":
+            new_title = text[:40] + ("..." if len(text) > 40 else "")
+            await db.db_pool.execute("UPDATE chats SET title = $1 WHERE id = $2", new_title, chat_id)
+
+        # 4. Compile history + profile into the prompt sent to Cartesian
+        history_rows = await db.db_pool.fetch(
+            "SELECT sender, text FROM messages WHERE chat_id = $1 AND id < $2 ORDER BY created_at ASC",
+            chat_id, user_msg_id,
+        )
+        profile_header = f"--- User Profile ---\n- Name: {current_user['name']}\n\n"
+        if history_rows:
+            history_str = "\n".join(
+                f"[{'User' if sender == 'user' else 'AI'}]: {msg}" for sender, msg in history_rows
+            )
+            history_block = f"--- Chat History ---\n{history_str}\n\n"
+        else:
+            history_block = ""
+        compiled_text = (
+            "System Instruction: Below is the context of the logged-in user and the chat history of this conversation. "
+            "Please use this information to answer the user's latest query at the end. "
+            "Respond ONLY to the latest query and do not repeat the context or history.\n\n"
+            f"{profile_header}{history_block}"
+            f"--- Latest User Query ---\n[User]: {text}"
+        )
+        logger.info("chat_message: compiled prompt (%d chars): %r", len(compiled_text), compiled_text)
+
+        # 5. Call Cartesian workflow
+        base_url = os.getenv("CARTESIAN_BASE_URL", "https://api.cartesian.ai")
+        client_id = os.getenv("CARTESIAN_CLIENT_ID")
+        client_secret = os.getenv("CARTESIAN_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            logger.error("chat_message: Cartesian API credentials missing in environment")
+            return {"error": "Cartesian API credentials are missing."}
+
+        headers = {
+            "x-client-id": client_id,
+            "x-client-secret": client_secret,
+            "Content-Type": "application/json",
+        }
+        params = {"waitSeconds": 30, "sessionId": session_id}
+        payload = {"payload": {"user_query": compiled_text, "user_id": current_user["email"]}}
+        url = f"{base_url.rstrip('/')}{CARTESIAN_JOB_PATH}"
+        poll_url_base = f"{base_url.rstrip('/')}{CARTESIAN_JOB_PATH}"
+
+        logger.info("cartesian: POST %s params=%s", url, params)
+
+        try:
+            async with httpx.AsyncClient() as client:
+                ai_text = await _call_cartesian_workflow(client, url, poll_url_base, params, payload, headers)
+        except httpx.HTTPError as e:
+            logger.error("cartesian: HTTP error communicating with Cartesian: %s", e)
+            return {"error": f"AI service communication error: {str(e)}"}
+
+        if ai_text is None:
+            logger.error("cartesian: no ai_text extractable from response")
+            return {"error": "Unexpected response from the AI service."}
+
+        logger.info("cartesian: extracted ai_text (%d chars): %r", len(ai_text), ai_text)
+
+        # 6. Save AI response
+        await db.db_pool.execute(
+            "INSERT INTO messages (chat_id, sender, text) VALUES ($1, $2, $3)",
+            chat_id, 'ai', ai_text,
+        )
+
+        head, groups, tail, _obj = _parse_ai_response_parts(ai_text)
+        product_count = sum(len(items) for _, _, items in groups)
+        logger.info(
+            "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d",
+            len(head), len(groups), product_count, len(tail),
+        )
+        return {"head": head, "groups": groups, "tail": tail}
+    except Exception as e:
+        # Belt-and-braces: this runs detached from any client connection, so
+        # an unhandled exception here would otherwise just vanish into an
+        # "exception was never retrieved" asyncio warning instead of being
+        # visible anywhere.
+        logger.error("chat_message: _generate_and_save_response failed: %s", e)
+        return {"error": f"Internal error while generating the response: {str(e)}"}
+    finally:
+        ticker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ticker_task
+        await db.redis_client.delete(pending_key)
+        await db.redis_client.delete(status_key)
+
+
 async def _stream_chat_message(session_id: Optional[str], text: str, current_user: dict) -> AsyncGenerator[str, None]:
     logger.info(
         "chat_message: request received user=%s(%s) session_id=%s text=%r",
@@ -330,116 +486,53 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
 
     yield f"event: chat\ndata: {json.dumps({'v': {'id': chat_id, 'session_id': session_id, 'title': title}})}\n\n"
 
-    # 2. Save user message
-    user_msg_row = await db.db_pool.fetchrow(
-        "INSERT INTO messages (chat_id, sender, text) VALUES ($1, $2, $3) RETURNING id",
-        chat_id, 'user', text,
+    # 2-6 (save user message, call Cartesian, save AI response) run as an
+    # independent task, created now so it's already underway. If the client
+    # disconnects (tab switch, backgrounding, network blip) while we're
+    # still waiting below, this task is NOT cancelled — it keeps running and
+    # still saves the response. Only our ability to *stream it live* is
+    # lost; the data itself is safe, and a later /api/chats/history call
+    # will show the completed response.
+    work_task = asyncio.create_task(
+        _generate_and_save_response(chat_id, session_id, title, text, current_user)
     )
-    user_msg_id = user_msg_row["id"]
 
-    # 3. Auto-title from first message
-    if title == "New Chat":
-        new_title = text[:40] + ("..." if len(text) > 40 else "")
-        await db.db_pool.execute("UPDATE chats SET title = $1 WHERE id = $2", new_title, chat_id)
-
-    # 4. Compile history + profile into the prompt sent to Cartesian
-    history_rows = await db.db_pool.fetch(
-        "SELECT sender, text FROM messages WHERE chat_id = $1 AND id < $2 ORDER BY created_at ASC",
-        chat_id, user_msg_id,
-    )
-    profile_header = f"--- User Profile ---\n- Name: {current_user['name']}\n\n"
-    if history_rows:
-        history_str = "\n".join(
-            f"[{'User' if sender == 'user' else 'AI'}]: {msg}" for sender, msg in history_rows
-        )
-        history_block = f"--- Chat History ---\n{history_str}\n\n"
-    else:
-        history_block = ""
-    compiled_text = (
-        "System Instruction: Below is the context of the logged-in user and the chat history of this conversation. "
-        "Please use this information to answer the user's latest query at the end. "
-        "Respond ONLY to the latest query and do not repeat the context or history.\n\n"
-        f"{profile_header}{history_block}"
-        f"--- Latest User Query ---\n[User]: {text}"
-    )
-    logger.info("chat_message: compiled prompt (%d chars): %r", len(compiled_text), compiled_text)
-
-    # 5. Call Cartesian workflow, streaming status ticks while we wait
-    base_url = os.getenv("CARTESIAN_BASE_URL", "https://api.cartesian.ai")
-    client_id = os.getenv("CARTESIAN_CLIENT_ID")
-    client_secret = os.getenv("CARTESIAN_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        logger.error("chat_message: Cartesian API credentials missing in environment")
-        yield f"event: error\ndata: {json.dumps({'detail': 'Cartesian API credentials are missing.'})}\n\n"
-        return
-
-    headers = {
-        "x-client-id": client_id,
-        "x-client-secret": client_secret,
-        "Content-Type": "application/json",
-    }
-    params = {"waitSeconds": 30, "sessionId": session_id}
-    payload = {"payload": {"user_query": compiled_text, "user_id": current_user["email"]}}
-    url = f"{base_url.rstrip('/')}{CARTESIAN_JOB_PATH}"
-
-    ai_text: Optional[str] = None
     yield f"event: status\ndata: {json.dumps({'v': random.choice(STATUS_MESSAGES)})}\n\n"
 
-    logger.info("cartesian: POST %s params=%s", url, params)
+    # Status ticks are read from the same Redis-backed ticker that
+    # _generate_and_save_response starts (see _status_ticker) rather than
+    # generated locally here — so a live viewer and a client that
+    # disconnects and later polls /api/chats/history's pending_status field
+    # see the identical rotating text, not two independently-random copies.
+    # Polled frequently (short timeout) but only yielded on change, so the
+    # visible cadence still matches the ticker's own 3-5s rotation.
+    last_status = None
+    while not work_task.done():
+        done, _ = await asyncio.wait({work_task}, timeout=1.5)
+        if work_task in done:
+            break
+        current_status = await get_pending_status(chat_id)
+        if current_status and current_status != last_status:
+            yield f"event: status\ndata: {json.dumps({'v': current_status})}\n\n"
+            last_status = current_status
 
-    async with httpx.AsyncClient() as client:
-        poll_url_base = f"{base_url.rstrip('/')}{CARTESIAN_JOB_PATH}"
-        task = asyncio.create_task(
-            _call_cartesian_workflow(client, url, poll_url_base, params, payload, headers)
-        )
+    # shield: even if *this* generator gets cancelled right at this exact
+    # await (client disconnects at this instant), work_task must not be —
+    # it's already saving/about to save the response.
+    result = await asyncio.shield(work_task)
 
-        # Status ticks run on their own 3-5s cadence, fully decoupled from
-        # whatever Cartesian is doing internally (sync wait or async polling)
-        # so the frontend always sees continuous progress regardless of path.
-        shuffled = random.sample(STATUS_MESSAGES, len(STATUS_MESSAGES))
-        tick_idx = 0
-        try:
-            while not task.done():
-                done, _ = await asyncio.wait({task}, timeout=random.uniform(3, 5))
-                if task in done:
-                    break
-                yield f"event: status\ndata: {json.dumps({'v': shuffled[tick_idx % len(shuffled)]})}\n\n"
-                tick_idx += 1
-                if tick_idx % len(shuffled) == 0:
-                    shuffled = random.sample(STATUS_MESSAGES, len(STATUS_MESSAGES))
-
-            ai_text = await task
-        except httpx.HTTPError as e:
-            logger.error("cartesian: HTTP error communicating with Cartesian: %s", e)
-            yield f"event: error\ndata: {json.dumps({'detail': f'AI service communication error: {str(e)}'})}\n\n"
-            return
-
-    if ai_text is None:
-        logger.error("cartesian: no ai_text extractable from response")
-        yield f"event: error\ndata: {json.dumps({'detail': 'Unexpected response from the AI service.'})}\n\n"
+    if "error" in result:
+        yield f"event: error\ndata: {json.dumps({'detail': result['error']})}\n\n"
         return
 
-    logger.info("cartesian: extracted ai_text (%d chars): %r", len(ai_text), ai_text)
-
-    # 6. Save AI response, then stream it out
-    await db.db_pool.execute(
-        "INSERT INTO messages (chat_id, sender, text) VALUES ($1, $2, $3)",
-        chat_id, 'ai', ai_text,
-    )
-
-    head, groups, tail, _obj = _parse_ai_response_parts(ai_text)
-    product_count = sum(len(items) for _, _, items in groups)
-    logger.info(
-        "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d",
-        len(head), len(groups), product_count, len(tail),
-    )
+    head, groups, tail = result["head"], result["groups"], result["tail"]
     if head:
         head_text = " ".join(head)
         yield f"event: message\ndata: {json.dumps({'v': head_text})}\n\n"
-    for _product_type, title, items in groups:
+    for _product_type, group_title, items in groups:
         if items:
-            if title:
-                title_text = f"\n\n**{title}**"
+            if group_title:
+                title_text = f"\n\n**{group_title}**"
                 yield f"event: message\ndata: {json.dumps({'v': title_text})}\n\n"
             yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
             await _cache_session_products(session_id, items)
