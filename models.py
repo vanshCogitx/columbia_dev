@@ -128,11 +128,11 @@ class CartItem(BaseModel):
     id: str
     name: str = Field(max_length=500)
     price: float
-    originalPrice: float
-    discount: float
+    originalPrice: Optional[float] = None  # defaults to price (no discount shown) when not sent — AI-recommended products don't carry this
+    discount: float = 0
     description: str = Field(max_length=5000)
     image: str = Field(max_length=2000)
-    quantity: int
+    quantity: int = 1
 
 class CartSaveRequest(BaseModel):
     email: str

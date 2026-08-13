@@ -52,7 +52,13 @@ async def get_cart(email: str):
     description="Replaces the entire cart with the given items list.",
 )
 async def save_cart(body: CartSaveRequest = Body(...)):
-    return await _save_items("carts", body.email.strip().lower(), [item.model_dump() for item in body.items])
+    items = []
+    for item in body.items:
+        dumped = item.model_dump()
+        if dumped["originalPrice"] is None:
+            dumped["originalPrice"] = dumped["price"]
+        items.append(dumped)
+    return await _save_items("carts", body.email.strip().lower(), items)
 
 
 @router.delete(

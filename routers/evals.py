@@ -149,7 +149,7 @@ async def get_evals_detail(feedback_id: int):
 
 
 STREAM_READ_BLOCK_MS = 5000
-STREAM_MAX_IDLE_BLOCKS = 60  # ~5 minutes total of no new messages before giving up
+STREAM_MAX_IDLE_BLOCKS = 24  # ~2 minutes total of no new messages before giving up on the live view (the background judge task itself is NOT cancelled by this — reopening the event later will show its real result once it lands)
 
 
 async def _stream_judge_events(feedback_id: int):
@@ -176,7 +176,11 @@ async def _stream_judge_events(feedback_id: int):
         if not result:
             idle_blocks += 1
             if idle_blocks > STREAM_MAX_IDLE_BLOCKS:
-                yield f"event: error\ndata: {json.dumps({'detail': 'stream timed out waiting for the judge'})}\n\n"
+                # Same 'data:'-only, type-tagged shape as every other event —
+                # a bare 'event: error' SSE field is never handled by the
+                # frontend's onmessage listener, so using it here silently
+                # dropped this message and left the UI spinning forever.
+                yield f"data: {json.dumps({'type': 'pipeline_error', 'detail': 'Timed out waiting for the judge — it may still finish in the background. Reopen this event later to check.'})}\n\n"
                 return
             continue
         idle_blocks = 0

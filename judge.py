@@ -16,6 +16,8 @@ library rather than a narrowed-down subset.
 import os
 import re
 import json
+import random
+import asyncio
 import logging
 
 import httpx
@@ -23,6 +25,13 @@ import httpx
 import db
 
 logger = logging.getLogger("columbia_backend.judge")
+
+# Retry policy for transient OpenRouter failures (429/5xx/timeout/mid-stream
+# error), per OpenRouter's own documented guidance: honor Retry-After when
+# present, otherwise exponential backoff with jitter.
+RETRY_MAX_ATTEMPTS = 3
+RETRY_INITIAL_BACKOFF = 1.0
+RETRY_MAX_BACKOFF = 60.0
 
 # OpenRouter's free NVIDIA Nemotron 3 Ultra endpoint — chosen over calling
 # Groq directly because its 1M-token context window and request-count-based
@@ -124,7 +133,7 @@ async def _publish_stream_event(feedback_id: int, event: dict) -> None:
 
 async def _call_judge(
     system_prompt: str, user_prompt: str, feedback_id: int, stage: str,
-    max_tokens: int = 2048, reasoning_max_tokens: int = 3000,
+    max_tokens: int = 2048, reasoning_max_tokens: int = 3000, wall_clock_timeout: float = 180,
 ) -> tuple[dict, str]:
     # Nemotron is a reasoning model — its chain-of-thought needs to be
     # explicitly enabled ('reasoning.enabled': true) to land in the separate
@@ -134,56 +143,110 @@ async def _call_judge(
     # Streams token-by-token (stream: true) so the evals dashboard can show
     # the model's thinking live, publishing each delta to this feedback
     # event's Redis Stream as it arrives. Returns (parsed_json, thinking_text).
-    thinking_parts: list[str] = []
-    content_parts: list[str] = []
-    async with httpx.AsyncClient() as client:
-        async with client.stream(
-            "POST",
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": OPENROUTER_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.2,
-                "max_tokens": max_tokens,
-                "reasoning": {"enabled": True, "max_tokens": reasoning_max_tokens},
-                "stream": True,
-            },
-            timeout=180,
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                payload = line[len("data:"):].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                # Some streaming chunks (e.g. metadata-only/final usage chunks)
-                # carry "choices": [] rather than omitting the key entirely —
-                # a plain .get("choices", [{}])[0] still IndexErrors on those
-                # since the default only applies when the key is missing.
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {})
-                reasoning_delta = delta.get("reasoning")
-                content_delta = delta.get("content")
-                if reasoning_delta:
-                    thinking_parts.append(reasoning_delta)
-                    await _publish_stream_event(feedback_id, {"stage": stage, "type": "thinking", "delta": reasoning_delta})
-                if content_delta:
-                    content_parts.append(content_delta)
-                    await _publish_stream_event(feedback_id, {"stage": stage, "type": "content", "delta": content_delta})
+    #
+    # httpx's own `timeout=` only bounds each individual read — a stream that
+    # keeps trickling a chunk every few seconds forever never trips it, so a
+    # stalled/slow-drip response can hang indefinitely. asyncio.wait_for wraps
+    # the whole call in a real wall-clock cap so that failure mode becomes a
+    # normal TimeoutError instead of a task that just never returns (this is
+    # exactly what happened to two real feedback events that got permanently
+    # stuck in production before this fix).
+    async def _do_stream() -> tuple[list[str], list[str]]:
+        thinking_parts: list[str] = []
+        content_parts: list[str] = []
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST",
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENROUTER_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                    "reasoning": {"enabled": True, "max_tokens": reasoning_max_tokens},
+                    "stream": True,
+                },
+                timeout=wall_clock_timeout,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    # Some streaming chunks (e.g. metadata-only/final usage chunks)
+                    # carry "choices": [] rather than omitting the key entirely —
+                    # a plain .get("choices", [{}])[0] still IndexErrors on those
+                    # since the default only applies when the key is missing.
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    # A rate-limit/error that hits *after* streaming has
+                    # already started a 200 response never becomes an HTTP
+                    # error — OpenRouter reports it as a normal-looking chunk
+                    # with finish_reason: "error" instead. Without checking
+                    # this explicitly, the loop just keeps waiting for more
+                    # 'data:' lines that are never coming — a second, distinct
+                    # way for a call to hang beyond the wall-clock-timeout
+                    # case above. (Confirmed via OpenRouter's own docs.)
+                    finish_reason = choices[0].get("finish_reason")
+                    if finish_reason == "error":
+                        raise RuntimeError(f"OpenRouter reported a mid-stream error (finish_reason=error) for stage '{stage}'")
+                    delta = choices[0].get("delta", {})
+                    reasoning_delta = delta.get("reasoning")
+                    content_delta = delta.get("content")
+                    if reasoning_delta:
+                        thinking_parts.append(reasoning_delta)
+                        await _publish_stream_event(feedback_id, {"stage": stage, "type": "thinking", "delta": reasoning_delta})
+                    if content_delta:
+                        content_parts.append(content_delta)
+                        await _publish_stream_event(feedback_id, {"stage": stage, "type": "content", "delta": content_delta})
+        return thinking_parts, content_parts
+
+    # Retry transient failures with backoff, per OpenRouter's own guidance:
+    # honor Retry-After when present (typical on 429s), otherwise exponential
+    # backoff with jitter. Free-tier models are the least reliable tier by
+    # design (heaviest throttling, underlying-provider congestion that
+    # OpenRouter itself doesn't see) — most stalls/errors we've hit in
+    # practice are transient, so a couple of retries clears the large
+    # majority of them silently instead of surfacing as a failure.
+    thinking_parts = content_parts = None
+    for attempt in range(RETRY_MAX_ATTEMPTS):
+        try:
+            thinking_parts, content_parts = await asyncio.wait_for(_do_stream(), timeout=wall_clock_timeout)
+            break
+        except asyncio.TimeoutError as e:
+            last_exc, retry_after = RuntimeError(f"judge stage '{stage}' exceeded its {wall_clock_timeout:.0f}s wall-clock limit"), None
+        except httpx.HTTPStatusError as e:
+            retryable = e.response.status_code in (429, 500, 502, 503, 504)
+            if not retryable:
+                raise
+            last_exc = e
+            retry_after = e.response.headers.get("Retry-After")
+        except (httpx.TransportError, RuntimeError) as e:
+            last_exc, retry_after = e, None
+
+        if attempt == RETRY_MAX_ATTEMPTS - 1:
+            raise last_exc
+        delay = float(retry_after) if retry_after else min(RETRY_MAX_BACKOFF, RETRY_INITIAL_BACKOFF * (2 ** attempt))
+        delay *= 1 + random.uniform(-0.2, 0.2)
+        logger.warning(
+            "judge: stage '%s' attempt %d/%d failed (%s), retrying in %.1fs",
+            stage, attempt + 1, RETRY_MAX_ATTEMPTS, last_exc, delay,
+        )
+        await asyncio.sleep(delay)
 
     full_thinking = "".join(thinking_parts)
     parsed = _parse_json_response("".join(content_parts))
@@ -261,6 +324,7 @@ async def run_judge_pipeline(feedback_id: int) -> None:
                     f"Failure analysis: {corrected_reasoning}\n\nAGENT PROMPTS:\n{library}",
                     feedback_id, "attribution",
                     max_tokens=6000,  # verified sufficient (finish_reason=stop) with reasoning.enabled over the real ~25k-token prompt library
+                    wall_clock_timeout=300,  # this stage's ~25k-token prompt has historically taken longer (up to ~250s observed) than Stage B's small calls
                 )
                 root_cause_node = attribution.get("root_cause_node")
                 root_cause_snippet = attribution.get("root_cause_snippet")
