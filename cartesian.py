@@ -84,11 +84,14 @@ def _extract_ai_text(output_obj: dict) -> Optional[str]:
     return None
 
 
-async def _call_cartesian_workflow(client: httpx.AsyncClient, url: str, poll_url_base: str, params: dict, payload: dict, headers: dict) -> Optional[str]:
+async def _call_cartesian_workflow(client: httpx.AsyncClient, url: str, poll_url_base: str, params: dict, payload: dict, headers: dict) -> tuple[Optional[str], Optional[dict]]:
     """Runs the full Cartesian call (initial POST, then the poll loop if the
-    job was accepted for async processing). Returns the extracted ai_text,
-    or None if nothing usable came back. Runs as a background task so the
-    caller can tick status messages independently of this function's cadence."""
+    job was accepted for async processing). Returns (ai_text, raw_output) —
+    raw_output is the full 'output' object (executionSummary, evaluatedBranches,
+    etc.) alongside the extracted text, so callers can persist it for later use
+    by the evals judge (see judge.py) even though ai_text is None/None if
+    nothing usable came back. Runs as a background task so the caller can tick
+    status messages independently of this function's cadence."""
     response = await client.post(url, json=payload, params=params, headers=headers, timeout=40)
     response.raise_for_status()
     data = response.json()
@@ -111,16 +114,18 @@ async def _call_cartesian_workflow(client: httpx.AsyncClient, url: str, poll_url
                 attempt + 1, max_retries, poll_data.get("isCompleted"), poll_data_raw,
             )
             if poll_data.get("isCompleted"):
-                return _extract_ai_text(poll_data.get("output", {}))
+                output = poll_data.get("output", {})
+                return _extract_ai_text(output), output
         logger.error("cartesian: timed out after %d poll attempts", max_retries)
-        return None
+        return None, None
 
     if resp_data.get("ok") and not resp_data.get("accepted"):
         logger.info("cartesian: completed synchronously within wait window")
-        return _extract_ai_text(resp_data.get("output", {}))
+        output = resp_data.get("output", {})
+        return _extract_ai_text(output), output
 
     logger.error("cartesian: no ai_text extractable from response: %s", data)
-    return None
+    return None, None
 
 
 _PRODUCT_ARRAY_STRING_FIELDS = (
@@ -302,6 +307,26 @@ async def _rebuild_session_products_from_db(chat_id: int) -> list[dict]:
     return list(by_id.values())
 
 
+async def _save_message_trace(message_id: int, raw_output: Optional[dict]) -> None:
+    """Persists Cartesian's raw 'output' object (executionSummary,
+    evaluatedBranches, etc.) alongside a saved AI message — needed by the
+    evals judge (judge.py) later, since feedback can arrive long after the
+    run is over and we can't re-fetch this from Cartesian at that point."""
+    if not raw_output:
+        return
+    await db.db_pool.execute(
+        """
+        INSERT INTO message_traces (message_id, raw_output, evaluated_branches, execution_summary)
+        VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb)
+        ON CONFLICT (message_id) DO NOTHING
+        """,
+        message_id,
+        json.dumps(raw_output),
+        json.dumps(raw_output.get("evaluatedBranches")),
+        json.dumps(raw_output.get("executionSummary")),
+    )
+
+
 PENDING_RESPONSE_TTL_SECONDS = 300  # safety-net expiry only, in case the process dies before the finally block runs
 
 
@@ -418,7 +443,7 @@ async def _generate_and_save_response(
 
         try:
             async with httpx.AsyncClient() as client:
-                ai_text = await _call_cartesian_workflow(client, url, poll_url_base, params, payload, headers)
+                ai_text, raw_output = await _call_cartesian_workflow(client, url, poll_url_base, params, payload, headers)
         except httpx.HTTPError as e:
             logger.error("cartesian: HTTP error communicating with Cartesian: %s", e)
             return {"error": f"AI service communication error: {str(e)}"}
@@ -430,10 +455,11 @@ async def _generate_and_save_response(
         logger.info("cartesian: extracted ai_text (%d chars): %r", len(ai_text), ai_text)
 
         # 6. Save AI response
-        await db.db_pool.execute(
-            "INSERT INTO messages (chat_id, sender, text) VALUES ($1, $2, $3)",
+        ai_msg_row = await db.db_pool.fetchrow(
+            "INSERT INTO messages (chat_id, sender, text) VALUES ($1, $2, $3) RETURNING id",
             chat_id, 'ai', ai_text,
         )
+        await _save_message_trace(ai_msg_row["id"], raw_output)
 
         head, groups, tail, _obj = _parse_ai_response_parts(ai_text)
         product_count = sum(len(items) for _, _, items in groups)

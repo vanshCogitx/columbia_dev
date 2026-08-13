@@ -39,6 +39,7 @@ class ChatResponseModel(BaseModel):
     created_at: str
 
 class ChatHistoryMessage(BaseModel):
+    id: int
     role: str
     content: str
     content_type: Optional[str] = None
@@ -56,6 +57,66 @@ class ChatHistoryResponse(BaseModel):
 class ChatMessageRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Existing chat's session_id. Omit to start a new chat.")
     text: str
+
+class FeedbackRequest(BaseModel):
+    message_id: int = Field(..., description="ID of the AI message being rated (from ChatHistoryMessage, not exposed today — see note in the endpoint).")
+    rating: str = Field(..., description="'up' or 'down'.")
+    reason: Optional[str] = Field(None, description="Optional free-text reason, mainly useful for 'down' ratings.")
+
+class FeedbackResponse(BaseModel):
+    id: int
+    message_id: int
+    rating: str
+
+# --- Evals Dashboard Schemas (prototype, no auth) ---
+
+class EvalsFeedItem(BaseModel):
+    feedback_id: int
+    created_at: str
+    rating: str
+    reason: Optional[str] = None
+    query: Optional[str] = None
+    response_snippet: Optional[str] = None
+    judged: bool
+    corrected_score: Optional[float] = None
+    root_cause_node: Optional[str] = None
+    error: Optional[str] = None
+
+class EvalsFeedResponse(BaseModel):
+    items: List[EvalsFeedItem]
+
+class EvalsDetailResponse(BaseModel):
+    feedback_id: int
+    chat_id: int
+    message_id: int
+    rating: str
+    reason: Optional[str] = None
+    created_at: str
+    query: Optional[str] = None
+    response: Optional[str] = None
+    judged: bool
+    judged_at: Optional[str] = None
+    initial_score: Optional[float] = None
+    corrected_score: Optional[float] = None
+    judge_reasoning: Optional[str] = None
+    root_cause_node: Optional[str] = None
+    root_cause_snippet: Optional[str] = None
+    root_cause_explanation: Optional[str] = None
+    draft_thinking: Optional[str] = None
+    critique_thinking: Optional[str] = None
+    attribution_thinking: Optional[str] = None
+    error: Optional[str] = None
+
+class EvalsRootCauseCount(BaseModel):
+    root_cause_node: str
+    count: int
+
+class EvalsStatsResponse(BaseModel):
+    total_feedback: int
+    up_count: int
+    down_count: int
+    avg_score: Optional[float] = None
+    top_root_causes: List[EvalsRootCauseCount]
 
 class SessionProductsResponse(BaseModel):
     session_id: str

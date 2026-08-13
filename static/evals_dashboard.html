@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Evals Dashboard</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #12151c;
+    --border: #232733;
+    --text: #e6e8ee;
+    --muted: #8891a3;
+    --green: #34d399;
+    --red: #f87171;
+    --amber: #fbbf24;
+    --accent: #7c9cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header {
+    padding: 20px 28px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+  header h1 {
+    font-size: 18px;
+    margin: 0;
+    font-weight: 600;
+  }
+  .stats {
+    display: flex;
+    gap: 24px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .stats b { color: var(--text); font-weight: 600; }
+  .stat-up { color: var(--green); }
+  .stat-down { color: var(--red); }
+  main {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 20px 16px 80px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 10px;
+    overflow: hidden;
+    transition: border-color 0.15s;
+  }
+  .card.new { border-color: var(--accent); }
+  .card-summary {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .card-summary:hover { background: #171b24; }
+  .status-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .status-good { background: var(--green); }
+  .status-bad { background: var(--red); }
+  .status-pending {
+    background: var(--amber);
+    animation: pulse 1.2s infinite ease-in-out;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .card-main { flex: 1; min-width: 0; }
+  .card-query {
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .card-meta {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 3px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  .badge {
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 5px;
+    font-weight: 600;
+  }
+  .badge-up { background: rgba(52,211,153,0.15); color: var(--green); }
+  .badge-down { background: rgba(248,113,113,0.15); color: var(--red); }
+  .badge-score { background: rgba(124,156,255,0.15); color: var(--accent); }
+  .card-time { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+  .card-detail {
+    display: none;
+    padding: 0 16px 18px;
+    border-top: 1px solid var(--border);
+  }
+  .card.expanded .card-detail { display: block; }
+  .detail-section { margin-top: 14px; }
+  .detail-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin-bottom: 5px;
+    font-weight: 600;
+  }
+  .detail-text {
+    font-size: 13.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .snippet-box {
+    background: #1a1400;
+    border: 1px solid #4a3d00;
+    color: #ffd666;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: ui-monospace, monospace;
+  }
+  details.thinking {
+    margin-top: 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  details.thinking summary {
+    padding: 8px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  details.thinking .detail-text {
+    padding: 0 10px 10px;
+    font-size: 12.5px;
+    color: #b8bfcc;
+    font-family: ui-monospace, monospace;
+  }
+  .empty {
+    text-align: center;
+    color: var(--muted);
+    padding: 60px 20px;
+    font-size: 14px;
+  }
+  .loading-dot { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Evals Dashboard</h1>
+  <div class="stats" id="stats">
+    <span>loading stats...</span>
+  </div>
+</header>
+
+<main>
+  <div id="feed"></div>
+  <div class="empty" id="empty" style="display:none">No feedback yet — waiting for the first thumbs up/down.</div>
+</main>
+
+<script>
+const FEED_URL = '/api/evals/feed?limit=100';
+const STATS_URL = '/api/evals/stats';
+const POLL_MS = 4000;
+
+let knownIds = new Set();
+let expandedIds = new Set();
+
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function timeAgo(iso) {
+  const diff = (Date.now() - new Date(iso + 'Z')) / 1000;
+  if (diff < 60) return Math.floor(diff) + 's ago';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
+
+function statusDot(item) {
+  if (!item.judged) return 'status-pending';
+  const s = item.corrected_score;
+  if (s === null || s === undefined) return 'status-pending';
+  return s < 0.5 ? 'status-bad' : 'status-good';
+}
+
+function scoreBadge(item) {
+  if (!item.judged) return '<span class="badge" style="background:rgba(251,191,36,0.15);color:#fbbf24">judging…</span>';
+  if (item.corrected_score === null || item.corrected_score === undefined) return '';
+  return `<span class="badge badge-score">score ${item.corrected_score.toFixed(2)}</span>`;
+}
+
+function renderCard(item) {
+  const expanded = expandedIds.has(item.feedback_id);
+  return `
+    <div class="card ${expanded ? 'expanded' : ''}" data-id="${item.feedback_id}">
+      <div class="card-summary" onclick="toggleCard(${item.feedback_id})">
+        <div class="status-dot ${statusDot(item)}"></div>
+        <div class="card-main">
+          <div class="card-query">${esc(item.query || '(no query found)')}</div>
+          <div class="card-meta">
+            <span class="badge ${item.rating === 'up' ? 'badge-up' : 'badge-down'}">${item.rating === 'up' ? '👍 up' : '👎 down'}</span>
+            ${scoreBadge(item)}
+            ${item.root_cause_node ? `<span class="badge" style="background:rgba(124,156,255,0.15);color:#7c9cff">→ ${esc(item.root_cause_node)}</span>` : ''}
+          </div>
+        </div>
+        <div class="card-time">${timeAgo(item.created_at)}</div>
+      </div>
+      <div class="card-detail" id="detail-${item.feedback_id}">
+        <div class="loading-dot">loading detail…</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderDetail(d) {
+  let html = '';
+  html += `<div class="detail-section"><div class="detail-label">Query</div><div class="detail-text">${esc(d.query)}</div></div>`;
+  html += `<div class="detail-section"><div class="detail-label">AI Response</div><div class="detail-text">${esc(d.response)}</div></div>`;
+  if (d.reason) {
+    html += `<div class="detail-section"><div class="detail-label">Feedback Reason</div><div class="detail-text">${esc(d.reason)}</div></div>`;
+  }
+  if (!d.judged) {
+    html += `<div class="detail-section loading-dot">Judge is still working on this one…</div>`;
+    return html;
+  }
+  html += `<div class="detail-section"><div class="detail-label">Judge Verdict (${d.initial_score !== null ? d.initial_score.toFixed(2) : '?'} → ${d.corrected_score !== null ? d.corrected_score.toFixed(2) : '?'})</div><div class="detail-text">${esc(d.judge_reasoning)}</div></div>`;
+  if (d.root_cause_node) {
+    html += `<div class="detail-section"><div class="detail-label">Root Cause — ${esc(d.root_cause_node)}</div>`;
+    if (d.root_cause_snippet) html += `<div class="snippet-box">"${esc(d.root_cause_snippet)}"</div>`;
+    html += `<div class="detail-text" style="margin-top:8px">${esc(d.root_cause_explanation)}</div></div>`;
+  }
+  if (d.draft_thinking) {
+    html += `<details class="thinking"><summary>Model thinking — draft score</summary><div class="detail-text">${esc(d.draft_thinking)}</div></details>`;
+  }
+  if (d.critique_thinking) {
+    html += `<details class="thinking"><summary>Model thinking — self-critique</summary><div class="detail-text">${esc(d.critique_thinking)}</div></details>`;
+  }
+  if (d.attribution_thinking) {
+    html += `<details class="thinking"><summary>Model thinking — root-cause attribution</summary><div class="detail-text">${esc(d.attribution_thinking)}</div></details>`;
+  }
+  return html;
+}
+
+async function toggleCard(id) {
+  const card = document.querySelector(`.card[data-id="${id}"]`);
+  if (expandedIds.has(id)) {
+    expandedIds.delete(id);
+    card.classList.remove('expanded');
+    return;
+  }
+  expandedIds.add(id);
+  card.classList.add('expanded');
+  const detailEl = document.getElementById(`detail-${id}`);
+  try {
+    const res = await fetch(`/api/evals/feed/${id}`);
+    const d = await res.json();
+    detailEl.innerHTML = renderDetail(d);
+  } catch (e) {
+    detailEl.innerHTML = '<div class="loading-dot">failed to load detail</div>';
+  }
+}
+
+async function pollFeed() {
+  try {
+    const res = await fetch(FEED_URL);
+    const data = await res.json();
+    const items = data.items || [];
+    document.getElementById('empty').style.display = items.length === 0 ? 'block' : 'none';
+
+    const feedEl = document.getElementById('feed');
+    feedEl.innerHTML = items.map(renderCard).join('');
+
+    // Re-render open detail panels with fresh data (e.g. pending -> judged)
+    for (const id of expandedIds) {
+      if (items.some(i => i.feedback_id === id)) toggleReopenSilently(id);
+    }
+
+    knownIds = new Set(items.map(i => i.feedback_id));
+  } catch (e) {
+    console.error('feed poll failed', e);
+  }
+}
+
+async function toggleReopenSilently(id) {
+  const card = document.querySelector(`.card[data-id="${id}"]`);
+  if (!card) return;
+  card.classList.add('expanded');
+  const detailEl = document.getElementById(`detail-${id}`);
+  try {
+    const res = await fetch(`/api/evals/feed/${id}`);
+    const d = await res.json();
+    detailEl.innerHTML = renderDetail(d);
+  } catch (e) { /* ignore, next poll retries */ }
+}
+
+async function pollStats() {
+  try {
+    const res = await fetch(STATS_URL);
+    const s = await res.json();
+    const avg = s.avg_score !== null && s.avg_score !== undefined ? s.avg_score.toFixed(2) : '—';
+    document.getElementById('stats').innerHTML = `
+      <span><b>${s.total_feedback}</b> total</span>
+      <span class="stat-up"><b>${s.up_count}</b> up</span>
+      <span class="stat-down"><b>${s.down_count}</b> down</span>
+      <span>avg score <b>${avg}</b></span>
+    `;
+  } catch (e) { /* ignore */ }
+}
+
+pollFeed();
+pollStats();
+setInterval(pollFeed, POLL_MS);
+setInterval(pollStats, POLL_MS);
+</script>
+
+</body>
+</html>

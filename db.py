@@ -98,6 +98,113 @@ async def init_db(pool: asyncpg.Pool):
         )
         """)
 
+        # Evals system, Layer 1: thumbs up/down feedback on an AI message,
+        # with an optional free-text reason. This is what triggers the
+        # Layer 2 judge pipeline (see judge.py) — the judge only ever runs
+        # off real feedback, not on every response.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS response_feedback (
+            id SERIAL PRIMARY KEY,
+            chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+            message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            rating TEXT NOT NULL CHECK (rating IN ('up', 'down')),
+            reason TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_message ON response_feedback(message_id)")
+
+        # Evals system: static reference copy of the Cartesian workflow's own
+        # node definitions (prompts, model config, graph edges), imported from
+        # a manually-exported workflow JSON via tools/ingest_workflow.py. Never
+        # fetched at request time — this is the prompt library the Layer 2
+        # judge reads from for root-cause attribution. A new version row is
+        # inserted on every import (never overwritten) so past versions stay
+        # available for correlating "did quality drop after this prompt changed".
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS workflow_versions (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            raw_json JSONB NOT NULL,
+            is_active BOOLEAN NOT NULL DEFAULT true,
+            imported_at TIMESTAMPTZ DEFAULT now()
+        )
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS workflow_nodes (
+            id SERIAL PRIMARY KEY,
+            workflow_version_id INTEGER NOT NULL REFERENCES workflow_versions(id) ON DELETE CASCADE,
+            node_id TEXT NOT NULL,
+            node_type TEXT NOT NULL,
+            alias TEXT,
+            agent_instructions TEXT,
+            model TEXT,
+            provider TEXT,
+            temperature REAL,
+            raw_config JSONB,
+            UNIQUE (workflow_version_id, node_id)
+        )
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS workflow_edges (
+            id SERIAL PRIMARY KEY,
+            workflow_version_id INTEGER NOT NULL REFERENCES workflow_versions(id) ON DELETE CASCADE,
+            source_node_id TEXT NOT NULL,
+            target_node_id TEXT NOT NULL,
+            source_handle TEXT
+        )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_nodes_version ON workflow_nodes(workflow_version_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_edges_version ON workflow_edges(workflow_version_id)")
+
+        # Raw Cartesian response metadata for each AI message, saved at
+        # generation time since feedback (and therefore the Layer 2 judge)
+        # can arrive long after the run is over — we can't go re-fetch this
+        # from Cartesian later. Not required for the judge's MVP logic today
+        # (see judge.py), kept for future root-cause precision if Cartesian
+        # ever exposes a richer per-node execution trace.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_traces (
+            message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+            raw_output JSONB,
+            evaluated_branches JSONB,
+            execution_summary JSONB,
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+        """)
+
+        # Evals system, Layer 2 output — see judge.py. One row per feedback
+        # event: initial_score/corrected_score are the self-critique pass's
+        # before/after (Stage B); root_cause_* are only populated for bad
+        # verdicts (Stage C).
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS response_judgments (
+            id SERIAL PRIMARY KEY,
+            feedback_id INTEGER NOT NULL REFERENCES response_feedback(id) ON DELETE CASCADE,
+            initial_score REAL,
+            corrected_score REAL,
+            judge_reasoning TEXT,
+            root_cause_node TEXT,
+            root_cause_snippet TEXT,
+            root_cause_explanation TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+        """)
+        # Raw model "thinking" per stage — surfaced in the evals dashboard so
+        # you can see not just the final verdict but how the judge reasoned
+        # its way there.
+        await conn.execute("ALTER TABLE response_judgments ADD COLUMN IF NOT EXISTS draft_thinking TEXT")
+        await conn.execute("ALTER TABLE response_judgments ADD COLUMN IF NOT EXISTS critique_thinking TEXT")
+        await conn.execute("ALTER TABLE response_judgments ADD COLUMN IF NOT EXISTS attribution_thinking TEXT")
+        # Set when the pipeline raised instead of completing — without this,
+        # a failed run never inserts a row at all, so the dashboard's "judged"
+        # check (row exists?) can't tell "still running" apart from "finished,
+        # but failed", and the feed list spins forever instead of showing the
+        # error.
+        await conn.execute("ALTER TABLE response_judgments ADD COLUMN IF NOT EXISTS error TEXT")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_judgments_feedback ON response_judgments(feedback_id)")
+
         # Product catalog tables (previously populated by ingest_to_pinecone.py into SQLite)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS product_family (

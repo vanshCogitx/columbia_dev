@@ -12,9 +12,10 @@ from fastapi.responses import StreamingResponse
 
 import db
 import cartesian
+import judge
 from models import (
     ChatResponseModel, ChatHistoryMessage, ChatHistoryResponse, ChatMessageRequest,
-    SessionProductsResponse, CartesianChatRequest,
+    SessionProductsResponse, CartesianChatRequest, FeedbackRequest, FeedbackResponse,
 )
 
 logger = logging.getLogger("columbia_backend")
@@ -205,8 +206,8 @@ async def get_chat_history(
         # can starve the others out of the response entirely.
         rows = await db.db_pool.fetch(
             """
-            SELECT chat_id, sender, text, created_at FROM (
-                SELECT chat_id, sender, text, created_at,
+            SELECT id, chat_id, sender, text, created_at FROM (
+                SELECT id, chat_id, sender, text, created_at,
                        ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY created_at DESC) AS rn
                 FROM messages
                 WHERE chat_id = ANY($1::int[])
@@ -220,11 +221,11 @@ async def get_chat_history(
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
     messages = []
-    for chat_id, sender, text, created_at in rows:
+    for msg_id, chat_id, sender, text, created_at in rows:
         sid = session_by_chat.get(chat_id)
         if sender == "user":
             messages.append(ChatHistoryMessage(
-                role="user", content=text, session_id=sid, created_at=_to_iso(created_at),
+                id=msg_id, role="user", content=text, session_id=sid, created_at=_to_iso(created_at),
             ))
         else:
             head, groups, tail, obj = cartesian._parse_ai_response_parts(text)
@@ -251,6 +252,7 @@ async def get_chat_history(
             else:
                 content = " ".join(head + tail) or text
             messages.append(ChatHistoryMessage(
+                id=msg_id,
                 role="assistant",
                 content=content,
                 content_type=content_type,
@@ -322,3 +324,41 @@ async def post_chat_message(request: ChatMessageRequest = Body(...), current_use
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post(
+    "/api/chats/feedback",
+    response_model=FeedbackResponse,
+    tags=["chat"],
+    summary="Rate an AI response (evals system, Layer 1)",
+    description=(
+        "Thumbs up/down on a specific AI message, with an optional free-text reason. "
+        "Triggers the Layer 2 judge pipeline in the background — this endpoint returns "
+        "immediately, judging happens asynchronously."
+    )
+)
+async def post_feedback(request: FeedbackRequest = Body(...), current_user: dict = Depends(db.get_current_user)):
+    if request.rating not in ("up", "down"):
+        raise HTTPException(status_code=422, detail="rating must be 'up' or 'down'.")
+
+    owner_row = await db.db_pool.fetchrow(
+        """
+        SELECT m.id, m.chat_id FROM messages m
+        JOIN chats c ON c.id = m.chat_id
+        WHERE m.id = $1 AND c.user_id = $2 AND m.sender = 'ai'
+        """,
+        request.message_id, current_user["id"],
+    )
+    if not owner_row:
+        raise HTTPException(status_code=404, detail="Message not found or access denied.")
+
+    row = await db.db_pool.fetchrow(
+        "INSERT INTO response_feedback (chat_id, message_id, rating, reason) VALUES ($1, $2, $3, $4) RETURNING id",
+        owner_row["chat_id"], request.message_id, request.rating, request.reason,
+    )
+    feedback_id = row["id"]
+    logger.info("feedback: id=%s message_id=%s rating=%s", feedback_id, request.message_id, request.rating)
+
+    asyncio.create_task(judge.run_judge_pipeline(feedback_id))
+
+    return FeedbackResponse(id=feedback_id, message_id=request.message_id, rating=request.rating)
