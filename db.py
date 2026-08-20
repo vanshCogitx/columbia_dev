@@ -6,7 +6,7 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi import FastAPI, HTTPException, Security, Depends, Query
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 import asyncpg
 import redis.asyncio as redis_asyncio
@@ -157,13 +157,15 @@ async def init_db(pool: asyncpg.Pool):
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_nodes_version ON workflow_nodes(workflow_version_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_edges_version ON workflow_edges(workflow_version_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_nodes_node_id ON workflow_nodes(workflow_version_id, node_id)")
 
         # Raw Cartesian response metadata for each AI message, saved at
         # generation time since feedback (and therefore the Layer 2 judge)
         # can arrive long after the run is over — we can't go re-fetch this
-        # from Cartesian later. Not required for the judge's MVP logic today
-        # (see judge.py), kept for future root-cause precision if Cartesian
-        # ever exposes a richer per-node execution trace.
+        # from Cartesian later. raw_output.executionPath / .agentRawResponses
+        # tell judge.py's Stage C exactly which agents ran for this specific
+        # response, so it only needs those agents' prompts instead of the
+        # whole library (see run_judge_pipeline).
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS message_traces (
             message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
@@ -204,6 +206,88 @@ async def init_db(pool: asyncpg.Pool):
         # error.
         await conn.execute("ALTER TABLE response_judgments ADD COLUMN IF NOT EXISTS error TEXT")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_judgments_feedback ON response_judgments(feedback_id)")
+
+        # Evals system, "Testing" — proactive scenario simulation, distinct
+        # from the reactive real-user feedback above. An LLM plays a
+        # simulated shopper against the real Cartesian workflow for several
+        # turns; kept fully separate from chats/messages/response_feedback/
+        # response_judgments so synthetic test traffic never pollutes real
+        # chat history or evals stats. judgments columns are an intentional
+        # mirror of response_judgments' shape so judge.py's shared scoring
+        # core can write either table with the same result dict.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS simulation_scenarios (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            user_scenario TEXT NOT NULL,
+            success_criteria JSONB NOT NULL,
+            max_turns INTEGER NOT NULL DEFAULT 5,
+            mock_tools BOOLEAN NOT NULL DEFAULT false,
+            created_by_user_id INTEGER REFERENCES users(id),
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS simulation_runs (
+            id SERIAL PRIMARY KEY,
+            scenario_id INTEGER NOT NULL REFERENCES simulation_scenarios(id) ON DELETE CASCADE,
+            session_id TEXT UNIQUE NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed')),
+            turn_count INTEGER NOT NULL DEFAULT 0,
+            verdict TEXT CHECK (verdict IN ('pass', 'fail')),
+            verdict_reasoning TEXT,
+            verdict_thinking TEXT,
+            error TEXT,
+            started_at TIMESTAMPTZ DEFAULT now(),
+            completed_at TIMESTAMPTZ
+        )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_runs_scenario ON simulation_runs(scenario_id)")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS simulation_turns (
+            id SERIAL PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES simulation_runs(id) ON DELETE CASCADE,
+            turn_index INTEGER NOT NULL,
+            simulated_user_text TEXT NOT NULL,
+            ai_response_text TEXT,
+            raw_output JSONB,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            UNIQUE (run_id, turn_index)
+        )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_turns_run ON simulation_turns(run_id)")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS simulation_turn_feedback (
+            id SERIAL PRIMARY KEY,
+            turn_id INTEGER NOT NULL REFERENCES simulation_turns(id) ON DELETE CASCADE,
+            rating TEXT NOT NULL CHECK (rating IN ('up', 'down')),
+            reason TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_turn_feedback_turn ON simulation_turn_feedback(turn_id)")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS simulation_turn_judgments (
+            id SERIAL PRIMARY KEY,
+            turn_feedback_id INTEGER NOT NULL REFERENCES simulation_turn_feedback(id) ON DELETE CASCADE,
+            initial_score REAL,
+            corrected_score REAL,
+            judge_reasoning TEXT,
+            root_cause_node TEXT,
+            root_cause_snippet TEXT,
+            root_cause_explanation TEXT,
+            draft_thinking TEXT,
+            critique_thinking TEXT,
+            attribution_thinking TEXT,
+            error TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_turn_judgments_feedback ON simulation_turn_judgments(turn_feedback_id)")
 
         # Product catalog tables (previously populated by ingest_to_pinecone.py into SQLite)
         await conn.execute("""
@@ -285,8 +369,7 @@ async def init_db(pool: asyncpg.Pool):
     logger.info("Postgres tables ready.")
 
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security_bearer)):
-    token = credentials.credentials
+async def get_current_user_from_token(token: str) -> dict:
     try:
         payload = otp_auth.decode_jwt(token)
     except pyjwt.ExpiredSignatureError:
@@ -305,6 +388,18 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         "email": row["email"],
         "name": row["name"],
     }
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security_bearer)):
+    return await get_current_user_from_token(credentials.credentials)
+
+
+async def get_current_user_query(token: str = Query(...)):
+    """Same auth, but reads the JWT from a query param instead of the
+    Authorization header — needed for SSE endpoints, since browser
+    EventSource can't set custom headers. Used only by the evals dashboard's
+    stream endpoints (see routers/evals.py, routers/testing.py)."""
+    return await get_current_user_from_token(token)
 
 
 @asynccontextmanager

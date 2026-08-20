@@ -68,7 +68,7 @@ class FeedbackResponse(BaseModel):
     message_id: int
     rating: str
 
-# --- Evals Dashboard Schemas (prototype, no auth) ---
+# --- Evals Dashboard Schemas (gated behind the dashboard's own login — see routers/evals.py) ---
 
 class EvalsFeedItem(BaseModel):
     feedback_id: int
@@ -117,6 +117,122 @@ class EvalsStatsResponse(BaseModel):
     down_count: int
     avg_score: Optional[float] = None
     top_root_causes: List[EvalsRootCauseCount]
+
+# --- Testing (Simulation) Schemas ---
+# Proactive scenario testing: an LLM plays a simulated shopper against the
+# real Cartesian workflow for several turns, scored against success criteria.
+# Kept fully separate from the reactive Evals schemas above (see
+# simulation_scenarios/simulation_runs/simulation_turns/
+# simulation_turn_feedback/simulation_turn_judgments in db.py).
+
+class ScenarioCreateRequest(BaseModel):
+    name: str = Field(..., max_length=200)
+    user_scenario: str = Field(..., description="Free-text description of the simulated shopper's persona/goal.")
+    success_criteria: List[str] = Field(..., min_length=1, description="One or more criteria the conversation is judged against.")
+    max_turns: int = Field(5, ge=1, le=20)
+    mock_tools: bool = Field(False, description="Stored for UI parity with the reference design; not wired to any backend behavior yet.")
+
+class ScenarioResponse(BaseModel):
+    id: int
+    name: str
+    user_scenario: str
+    success_criteria: List[str]
+    max_turns: int
+    mock_tools: bool
+    created_at: str
+    last_run_status: Optional[str] = None
+    last_run_verdict: Optional[str] = None
+
+class ScenarioListResponse(BaseModel):
+    items: List[ScenarioResponse]
+
+class RunTriggerResponse(BaseModel):
+    run_id: int
+    status: str
+
+class SimulationTurnItem(BaseModel):
+    id: int
+    turn_index: int
+    simulated_user_text: str
+    ai_response_text: Optional[str] = None
+    raw_output: Optional[dict] = None
+    feedback_id: Optional[int] = None
+    feedback_rating: Optional[str] = None
+    judged: bool = False
+    corrected_score: Optional[float] = None
+    root_cause_node: Optional[str] = None
+
+class RunListItem(BaseModel):
+    run_id: int
+    scenario_id: int
+    scenario_name: str
+    status: str
+    turn_count: int
+    verdict: Optional[str] = None
+    started_at: str
+    completed_at: Optional[str] = None
+
+class RunListResponse(BaseModel):
+    items: List[RunListItem]
+
+class RunDetailResponse(BaseModel):
+    run_id: int
+    scenario_id: int
+    scenario_name: str
+    user_scenario: str
+    success_criteria: List[str]
+    max_turns: int
+    status: str
+    turn_count: int
+    verdict: Optional[str] = None
+    verdict_reasoning: Optional[str] = None
+    verdict_thinking: Optional[str] = None
+    error: Optional[str] = None
+    started_at: str
+    completed_at: Optional[str] = None
+    turns: List[SimulationTurnItem]
+
+class TurnFeedbackRequest(BaseModel):
+    rating: str = Field(..., description="'up' or 'down'.")
+    reason: Optional[str] = None
+
+class TurnFeedbackResponse(BaseModel):
+    id: int
+    turn_id: int
+    rating: str
+
+class TurnJudgmentDetailResponse(BaseModel):
+    """Judge-only fields for one simulated-turn feedback event — mirrors the
+    judge-specific subset of EvalsDetailResponse, so the frontend's shared
+    judge-verdict panel can render either source with the same component."""
+    turn_feedback_id: int
+    judged: bool
+    initial_score: Optional[float] = None
+    corrected_score: Optional[float] = None
+    judge_reasoning: Optional[str] = None
+    root_cause_node: Optional[str] = None
+    root_cause_snippet: Optional[str] = None
+    root_cause_explanation: Optional[str] = None
+    draft_thinking: Optional[str] = None
+    critique_thinking: Optional[str] = None
+    attribution_thinking: Optional[str] = None
+    error: Optional[str] = None
+
+class WorkflowGraphNode(BaseModel):
+    node_id: str
+    node_type: str
+    alias: Optional[str] = None
+    model: Optional[str] = None
+    provider: Optional[str] = None
+
+class WorkflowGraphEdge(BaseModel):
+    source_node_id: str
+    target_node_id: str
+    source_handle: Optional[str] = None
+
+class WorkflowGraphResponse(BaseModel):
+    nodes: List[WorkflowGraphNode]
+    edges: List[WorkflowGraphEdge]
 
 class SessionProductsResponse(BaseModel):
     session_id: str

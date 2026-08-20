@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import db
-from routers import auth, chat, cart, search, evals
+from routers import auth, chat, cart, search, evals, testing
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,3 +40,4 @@ app.include_router(chat.router)
 app.include_router(cart.router)
 app.include_router(search.router)
 app.include_router(evals.router)
+app.include_router(testing.router)

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import asyncpg
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 import db
@@ -26,11 +26,11 @@ async def get_evals_dashboard():
     with open(_DASHBOARD_HTML_PATH) as f:
         return HTMLResponse(content=f.read())
 
-# Prototype scope, deliberately not gated behind the customer-facing JWT login
-# (see routers/chat.py's get_current_user) — this is an internal panel over
-# response_feedback/response_judgments, read-only, no customer PII beyond
-# what's already in those tables. Add real access control before this is
-# ever exposed outside a trusted network.
+# Gated behind the same JWT login as the customer-facing app (see
+# db.get_current_user) — the evals dashboard now has its own standalone login
+# screen hitting the same /api/auth/* endpoints, not a separate auth system.
+# The 2 SSE endpoints below use get_current_user_query instead, since
+# EventSource can't set an Authorization header.
 
 _RESPONSE_SNIPPET_LEN = 200
 
@@ -83,7 +83,7 @@ LEFT JOIN response_judgments rj ON rj.feedback_id = rf.id
         "finished scoring yet (judged=false). Poll this for a live-updating feed."
     )
 )
-async def get_evals_feed(limit: int = Query(default=50, le=200)):
+async def get_evals_feed(limit: int = Query(default=50, le=200), current_user: dict = Depends(db.get_current_user)):
     try:
         rows = await db.db_pool.fetch(_FEED_QUERY + " ORDER BY rf.created_at DESC LIMIT $1", limit)
     except asyncpg.PostgresError as e:
@@ -115,7 +115,7 @@ async def get_evals_feed(limit: int = Query(default=50, le=200)):
     summary="Full detail for one feedback event (evals dashboard)",
     description="Complete query, response, feedback reason, judge scores, and the judge's raw reasoning per stage."
 )
-async def get_evals_detail(feedback_id: int):
+async def get_evals_detail(feedback_id: int, current_user: dict = Depends(db.get_current_user)):
     try:
         row = await db.db_pool.fetchrow(_FEED_QUERY + " WHERE rf.id = $1", feedback_id)
     except asyncpg.PostgresError as e:
@@ -207,7 +207,7 @@ async def _stream_judge_events(feedback_id: int):
         "final event and closes instead of replaying the whole stream."
     )
 )
-async def stream_evals_judge(feedback_id: int):
+async def stream_evals_judge(feedback_id: int, current_user: dict = Depends(db.get_current_user_query)):
     return StreamingResponse(
         _stream_judge_events(feedback_id),
         media_type="text/event-stream",
@@ -221,7 +221,7 @@ async def stream_evals_judge(feedback_id: int):
     tags=["evals"],
     summary="Aggregate stats for the evals dashboard header",
 )
-async def get_evals_stats():
+async def get_evals_stats(current_user: dict = Depends(db.get_current_user)):
     try:
         counts = await db.db_pool.fetchrow(
             """
