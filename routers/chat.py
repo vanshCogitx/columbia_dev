@@ -229,6 +229,7 @@ async def get_chat_history(
             ))
         else:
             head, groups, tail, obj = cartesian._parse_ai_response_parts(text)
+            is_add_to_cart = bool(obj) and obj.get("type") == "add_to_cart"
             # Only groups that actually have products get a title + marker +
             # widget — matches what live streaming does (skips empty groups,
             # and sends the group's title right before its products).
@@ -237,7 +238,10 @@ async def get_chat_history(
             content_type = None
             structured_data = None
             if has_products:
-                content_type = (obj.get("intent") if obj else None) or "product_discovery"
+                # add_to_cart gets its own content_type (same widget/marker
+                # shape as any other product reply) so the frontend can
+                # still tell a cart confirmation apart from a search result.
+                content_type = "add_to_cart" if is_add_to_cart else ((obj.get("intent") if obj else None) or "product_discovery")
                 parts = []
                 if head:
                     parts.append(" ".join(head))

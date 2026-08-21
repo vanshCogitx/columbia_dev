@@ -554,14 +554,26 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
 
     head, groups, tail = result["head"], result["groups"], result["tail"]
 
-    # add_to_cart is a distinct UX moment (confirming items just added), not
-    # narrative + a product carousel — just the workflow's own confirmation
-    # message, no product list. Everything else (including out_of_scope)
-    # falls through to the normal narrative + product_discovery streaming
-    # below, unchanged.
+    # add_to_cart is a distinct UX moment (confirming items just added):
+    # the confirmation text goes out as its own add_to_cart event, and the
+    # items themselves reuse the normal product_discovery event/shape —
+    # same as any other product-bearing reply — so the frontend renders
+    # them with its existing product widget. Everything else (including
+    # out_of_scope) falls through to the normal narrative + product_discovery
+    # streaming below, unchanged.
     if result.get("type") == "add_to_cart":
         message = " ".join(head) if head else None
         yield f"event: add_to_cart\ndata: {json.dumps({'v': {'message': message}})}\n\n"
+        for _product_type, group_title, items in groups:
+            if items:
+                if group_title:
+                    title_text = f"\n\n**{group_title}**"
+                    yield f"event: message\ndata: {json.dumps({'v': title_text})}\n\n"
+                yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
+                await _cache_session_products(session_id, items)
+        if tail:
+            tail_text = " ".join(tail)
+            yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
         yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
         yield f"event: end\ndata: {json.dumps({'v': {}})}\n\n"
         logger.info("chat_message: stream complete (add_to_cart) chat_id=%s session_id=%s", chat_id, session_id)
