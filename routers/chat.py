@@ -64,7 +64,7 @@ async def chat_endpoint(request: CartesianChatRequest = Body(...)):
     if request.session_id:
         params["sessionId"] = request.session_id
 
-    endpoint_path = "/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs"
+    endpoint_path = "/exports/rest-api/6a798ee58953bade21e86591/jobs"
     url = f"{base_url.rstrip('/')}{endpoint_path}"
 
     async with httpx.AsyncClient() as client:
@@ -86,7 +86,7 @@ async def chat_endpoint(request: CartesianChatRequest = Body(...)):
             if not run_id:
                 raise HTTPException(status_code=500, detail="Received accepted response but no runId")
 
-            poll_url = f"{base_url.rstrip('/')}/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs/{run_id}"
+            poll_url = f"{base_url.rstrip('/')}/exports/rest-api/6a798ee58953bade21e86591/jobs/{run_id}"
 
             # Poll until complete or timeout (e.g. 30 times with 2s delay = ~60s wait)
             max_retries = 30
@@ -315,7 +315,9 @@ async def get_session_products(session_id: str, current_user: dict = Depends(db.
     description=(
         "Combines chat creation and message sending into a single streamed endpoint. "
         "Omit session_id to start a new chat; pass an existing session_id to continue it. "
-        "Streams event: chat, status, message, product_discovery (when present), conversation_id, end."
+        "Streams event: chat, status, message, product_discovery (when present), conversation_id, end. "
+        "For an add_to_cart response, message/product_discovery are replaced by a single add_to_cart "
+        "event carrying {message} instead (no product list)."
     )
 )
 async def post_chat_message(request: ChatMessageRequest = Body(...), current_user: dict = Depends(db.get_current_user)):

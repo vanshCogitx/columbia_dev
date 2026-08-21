@@ -14,7 +14,7 @@ import db
 
 logger = logging.getLogger("columbia_backend")
 
-CARTESIAN_JOB_PATH = "/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs"
+CARTESIAN_JOB_PATH = "/exports/rest-api/6a798ee58953bade21e86591/jobs"
 STATUS_MESSAGES = [
     "Thinking...",
     "Searching the catalog...",
@@ -66,7 +66,7 @@ def _product_widget_marker(index: int) -> str:
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
-_NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType"}
+_NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType", "type"}
 
 
 def _extract_ai_text(output_obj: dict) -> Optional[str]:
@@ -461,13 +461,14 @@ async def _generate_and_save_response(
         )
         await _save_message_trace(ai_msg_row["id"], raw_output)
 
-        head, groups, tail, _obj = _parse_ai_response_parts(ai_text)
+        head, groups, tail, obj = _parse_ai_response_parts(ai_text)
         product_count = sum(len(items) for _, _, items in groups)
+        response_type = obj.get("type") if obj else None
         logger.info(
-            "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d",
-            len(head), len(groups), product_count, len(tail),
+            "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d type=%r",
+            len(head), len(groups), product_count, len(tail), response_type,
         )
-        return {"head": head, "groups": groups, "tail": tail}
+        return {"head": head, "groups": groups, "tail": tail, "type": response_type}
     except Exception as e:
         # Belt-and-braces: this runs detached from any client connection, so
         # an unhandled exception here would otherwise just vanish into an
@@ -552,6 +553,20 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         return
 
     head, groups, tail = result["head"], result["groups"], result["tail"]
+
+    # add_to_cart is a distinct UX moment (confirming items just added), not
+    # narrative + a product carousel — just the workflow's own confirmation
+    # message, no product list. Everything else (including out_of_scope)
+    # falls through to the normal narrative + product_discovery streaming
+    # below, unchanged.
+    if result.get("type") == "add_to_cart":
+        message = " ".join(head) if head else None
+        yield f"event: add_to_cart\ndata: {json.dumps({'v': {'message': message}})}\n\n"
+        yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
+        yield f"event: end\ndata: {json.dumps({'v': {}})}\n\n"
+        logger.info("chat_message: stream complete (add_to_cart) chat_id=%s session_id=%s", chat_id, session_id)
+        return
+
     if head:
         head_text = " ".join(head)
         yield f"event: message\ndata: {json.dumps({'v': head_text})}\n\n"
