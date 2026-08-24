@@ -4,12 +4,19 @@ then judge.py scores the full transcript against the scenario's success
 criteria. Kept fully separate from chats/messages (see simulation_runs/
 simulation_turns in db.py) so synthetic test traffic never touches real chat
 history or the reactive evals stats. Reuses cartesian._call_cartesian_workflow
-directly and unmodified — the same function real chat generation calls — and
-judge.py's NVIDIA credentials/model/streaming machinery, so this module holds
-no new credentials or duplicated infra.
+directly and unmodified — the same function real chat generation calls.
+Judging (judge.py's NVIDIA credentials/model/streaming machinery) is reused
+as-is, but the simulated-shopper call below deliberately does NOT share
+NVIDIA's judge model — that's a heavy 120B reasoning model on a shared,
+rate-limited free tier, complete overkill for "produce one line of shopper
+dialogue + a boolean", and coupling it to judge's model meant a judge-side
+outage took Testing down too. Runs on OpenRouter with a small model instead —
+a different provider, a different rate-limit pool, an already-unused API key
+in this project's .env.
 """
 import os
 import json
+import random
 import logging
 import asyncio
 
@@ -18,6 +25,7 @@ import httpx
 import db
 import cartesian
 import judge
+import projects as projects_module
 
 logger = logging.getLogger("columbia_backend.simulation")
 
@@ -26,6 +34,13 @@ logger = logging.getLogger("columbia_backend.simulation")
 # this, a stuck run (e.g. Cartesian queue backup) hangs the background task
 # forever instead of failing cleanly. See the plan's "Open risks" section.
 RUN_HARD_TIMEOUT_SECONDS = 900
+
+# Simulated shopper's own model — intentionally separate from judge.py's
+# NVIDIA_MODEL (see module docstring). OpenRouter, not NVIDIA: different
+# provider/rate-limit pool, so an NVIDIA outage can't block Testing too.
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+SIMULATED_USER_MODEL = "meta-llama/llama-3.1-8b-instruct"
 
 _SIMULATED_USER_SYSTEM_PROMPT_SUFFIX = """
 
@@ -53,33 +68,59 @@ async def _call_simulated_user(scenario_description: str, transcript_text: str) 
     _call_judge: this runs once per turn (several times per run) and there's
     no dashboard value in showing its 'thinking' token-by-token, so it skips
     Redis Stream publishing and extended reasoning entirely — small
-    max_tokens, thinking disabled. Extends this session's BREVITY_RULE lesson
-    more aggressively since the cost compounds per-turn, not once per
-    pipeline. Reuses judge's NVIDIA credentials/model — no new ones."""
+    max_tokens. Extends this session's BREVITY_RULE lesson more aggressively
+    since the cost compounds per-turn, not once per pipeline. Runs on
+    OpenRouter with SIMULATED_USER_MODEL (see module docstring for why this
+    is deliberately not judge's NVIDIA model). Retries transient failures
+    with the same backoff policy as judge._call_judge (judge.RETRY_*
+    constants) — a single 503/429 shouldn't fail an entire multi-turn run."""
     system_prompt = _build_simulated_user_system_prompt(scenario_description)
     user_prompt = f"Conversation so far:\n{transcript_text or '(nothing yet — this is the opening message)'}"
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            judge.NVIDIA_URL,
-            headers={"Authorization": f"Bearer {judge.NVIDIA_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": judge.NVIDIA_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.4,
-                "top_p": 0.95,
-                "max_tokens": 300,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "stream": False,
-            },
-            timeout=60,
+
+    last_exc = None
+    for attempt in range(judge.RETRY_MAX_ATTEMPTS):
+        retry_after = None
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    OPENROUTER_URL,
+                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": SIMULATED_USER_MODEL,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "temperature": 0.4,
+                        "top_p": 0.95,
+                        "max_tokens": 300,
+                        "stream": False,
+                    },
+                    timeout=60,
+                )
+                response.raise_for_status()
+                data = response.json()
+            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            return judge.parse_json_response(content)
+        except asyncio.TimeoutError:
+            last_exc = RuntimeError("simulated-user call timed out")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in (429, 500, 502, 503, 504):
+                raise
+            last_exc = e
+            retry_after = e.response.headers.get("Retry-After")
+        except httpx.TransportError as e:
+            last_exc = e
+
+        if attempt == judge.RETRY_MAX_ATTEMPTS - 1:
+            raise last_exc
+        delay = float(retry_after) if retry_after else min(judge.RETRY_MAX_BACKOFF, judge.RETRY_INITIAL_BACKOFF * (2 ** attempt))
+        delay *= 1 + random.uniform(-0.2, 0.2)
+        logger.warning(
+            "simulation: simulated-user call attempt %d/%d failed (%s), retrying in %.1fs",
+            attempt + 1, judge.RETRY_MAX_ATTEMPTS, last_exc, delay,
         )
-        response.raise_for_status()
-        data = response.json()
-    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-    return judge.parse_json_response(content)
+        await asyncio.sleep(delay)
 
 
 def _build_compiled_text(prior_turns: list[dict], latest_message: str) -> str:
@@ -117,13 +158,16 @@ async def _run_simulation_inner(run_id: int, stream_key: str) -> None:
         else scenario["success_criteria"]
     )
 
-    base_url = os.getenv("CARTESIAN_BASE_URL", "https://api.cartesian.ai")
-    client_id = os.getenv("CARTESIAN_CLIENT_ID")
-    client_secret = os.getenv("CARTESIAN_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        raise RuntimeError("Cartesian API credentials are missing.")
-    headers = {"x-client-id": client_id, "x-client-secret": client_secret, "Content-Type": "application/json"}
-    url = f"{base_url.rstrip('/')}{cartesian.CARTESIAN_JOB_PATH}"
+    # Unlike the real chat pipeline, Testing genuinely calls Cartesian with
+    # this scenario's own project's credentials — simulation_scenarios never
+    # touches chats/messages, so it's the one place per-project isolation is
+    # real today (see projects.py's module docstring).
+    try:
+        cfg = await projects_module.get_project_cartesian_config(scenario["project_id"])
+    except ValueError as e:
+        raise RuntimeError(str(e))
+    headers = {"x-client-id": cfg["client_id"], "x-client-secret": cfg["client_secret"], "Content-Type": "application/json"}
+    url = f"{cfg['base_url'].rstrip('/')}{cfg['job_path']}"
     poll_url_base = url
 
     turns: list[dict] = []
@@ -207,12 +251,17 @@ async def run_simulation(run_id: int) -> None:
     try:
         await asyncio.wait_for(_run_simulation_inner(run_id, stream_key), timeout=RUN_HARD_TIMEOUT_SECONDS)
     except Exception as e:
-        logger.error("simulation: run_id=%s failed: %s", run_id, e)
+        # str(e) is empty for some exception types (e.g. asyncio.TimeoutError)
+        # — repr(e) as a fallback so the DB/stream 'detail' is never blank,
+        # and logger.exception (not .error) so the full traceback actually
+        # lands in logs instead of just whatever str(e) happened to be.
+        detail = str(e) or repr(e)
+        logger.exception("simulation: run_id=%s failed", run_id)
         try:
             await db.db_pool.execute(
                 "UPDATE simulation_runs SET status = 'failed', error = $1, completed_at = now() WHERE id = $2",
-                str(e), run_id,
+                detail, run_id,
             )
         except Exception as update_err:
             logger.error("simulation: failed to record error for run_id=%s: %s", run_id, update_err)
-        await judge.publish_stream_event(stream_key, {"type": "run_error", "detail": str(e)})
+        await judge.publish_stream_event(stream_key, {"type": "run_error", "detail": detail})

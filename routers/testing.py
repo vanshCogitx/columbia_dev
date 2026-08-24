@@ -9,9 +9,11 @@ import asyncpg
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+import cache
 import db
 import judge
 import simulation
+import projects as projects_module
 from models import (
     ScenarioCreateRequest, ScenarioResponse, ScenarioListResponse,
     RunTriggerResponse, RunListResponse, RunListItem,
@@ -23,6 +25,20 @@ from models import (
 logger = logging.getLogger("columbia_backend")
 
 router = APIRouter()
+
+# See cache.py's module docstring / routers/evals.py's _EVALS_CACHE_TTL for
+# the same short-TTL-no-explicit-invalidation tradeoff. workflow-graph gets a
+# longer TTL since it only changes on a re-ingest (rare, deliberate).
+_TESTING_CACHE_TTL = 5
+_WORKFLOW_GRAPH_CACHE_TTL = 60
+
+# Every endpoint here is scoped to a project via a
+# /api/projects/{project_id}/testing/... path prefix and
+# Depends(projects_module.get_project_or_404), same convention as
+# routers/evals.py. Testing is the one place per-project Cartesian
+# credentials are actually used (see simulation.py) — simulation_scenarios
+# is a "root" table (see db.py), so scoping every other query here is a
+# single-hop join back to s.project_id.
 
 
 def _to_iso(ts: datetime) -> str:
@@ -44,21 +60,25 @@ def _as_dict(value) -> Optional[dict]:
 # --- Scenarios ---
 
 @router.post(
-    "/api/testing/scenarios",
+    "/api/projects/{project_id}/testing/scenarios",
     response_model=ScenarioResponse,
     tags=["testing"],
     summary="Create a test scenario",
 )
-async def create_scenario(request: ScenarioCreateRequest = Body(...), current_user: dict = Depends(db.get_current_user)):
+async def create_scenario(
+    request: ScenarioCreateRequest = Body(...),
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     try:
         row = await db.db_pool.fetchrow(
             """
-            INSERT INTO simulation_scenarios (name, user_scenario, success_criteria, max_turns, mock_tools, created_by_user_id)
-            VALUES ($1, $2, $3::jsonb, $4, $5, $6)
+            INSERT INTO simulation_scenarios (name, user_scenario, success_criteria, max_turns, mock_tools, created_by_user_id, project_id)
+            VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7)
             RETURNING id, name, user_scenario, success_criteria, max_turns, mock_tools, created_at
             """,
             request.name, request.user_scenario, json.dumps(request.success_criteria),
-            request.max_turns, request.mock_tools, current_user["id"],
+            request.max_turns, request.mock_tools, current_user["id"], project["id"],
         )
     except asyncpg.PostgresError as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
@@ -77,22 +97,35 @@ FROM simulation_scenarios s
 LEFT JOIN LATERAL (
     SELECT status, verdict FROM simulation_runs WHERE scenario_id = s.id ORDER BY started_at DESC LIMIT 1
 ) lr ON true
+WHERE s.project_id = $1
 """
 
 
 @router.get(
-    "/api/testing/scenarios",
+    "/api/projects/{project_id}/testing/scenarios",
     response_model=ScenarioListResponse,
     tags=["testing"],
     summary="List test scenarios, with each one's most recent run status",
 )
-async def list_scenarios(current_user: dict = Depends(db.get_current_user)):
+async def list_scenarios(
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
+    # Short TTL, no explicit invalidation on create/delete/trigger-run — same
+    # tradeoff as evals feed/stats (see cache.py docstring): this is already
+    # polled every few seconds, so a few seconds of staleness after a
+    # mutation is the existing UX, not a new regression.
+    cache_key = f"evalcache:scenarios:{project['id']}"
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return ScenarioListResponse(**cached)
+
     try:
-        rows = await db.db_pool.fetch(_SCENARIO_LIST_QUERY + " ORDER BY s.created_at DESC")
+        rows = await db.db_pool.fetch(_SCENARIO_LIST_QUERY + " ORDER BY s.created_at DESC", project["id"])
     except asyncpg.PostgresError as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
-    return ScenarioListResponse(items=[
+    result = ScenarioListResponse(items=[
         ScenarioResponse(
             id=r["id"], name=r["name"], user_scenario=r["user_scenario"],
             success_criteria=_as_list(r["success_criteria"]), max_turns=r["max_turns"],
@@ -100,17 +133,23 @@ async def list_scenarios(current_user: dict = Depends(db.get_current_user)):
             last_run_status=r["last_run_status"], last_run_verdict=r["last_run_verdict"],
         ) for r in rows
     ])
+    await cache.set_json(cache_key, result.model_dump(), _TESTING_CACHE_TTL)
+    return result
 
 
 @router.get(
-    "/api/testing/scenarios/{scenario_id}",
+    "/api/projects/{project_id}/testing/scenarios/{scenario_id}",
     response_model=ScenarioResponse,
     tags=["testing"],
     summary="Get a single scenario",
 )
-async def get_scenario(scenario_id: int, current_user: dict = Depends(db.get_current_user)):
+async def get_scenario(
+    scenario_id: int,
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     try:
-        row = await db.db_pool.fetchrow(_SCENARIO_LIST_QUERY + " WHERE s.id = $1", scenario_id)
+        row = await db.db_pool.fetchrow(_SCENARIO_LIST_QUERY + " AND s.id = $2", project["id"], scenario_id)
     except asyncpg.PostgresError as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
     if not row:
@@ -125,14 +164,19 @@ async def get_scenario(scenario_id: int, current_user: dict = Depends(db.get_cur
 
 
 @router.delete(
-    "/api/testing/scenarios/{scenario_id}",
+    "/api/projects/{project_id}/testing/scenarios/{scenario_id}",
     tags=["testing"],
     summary="Delete a scenario (cascades its runs and turns)",
 )
-async def delete_scenario(scenario_id: int, current_user: dict = Depends(db.get_current_user)):
+async def delete_scenario(
+    scenario_id: int,
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     try:
         deleted = await db.db_pool.fetchval(
-            "DELETE FROM simulation_scenarios WHERE id = $1 RETURNING id", scenario_id
+            "DELETE FROM simulation_scenarios WHERE id = $1 AND project_id = $2 RETURNING id",
+            scenario_id, project["id"],
         )
     except asyncpg.PostgresError as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
@@ -144,18 +188,24 @@ async def delete_scenario(scenario_id: int, current_user: dict = Depends(db.get_
 # --- Runs ---
 
 @router.post(
-    "/api/testing/scenarios/{scenario_id}/run",
+    "/api/projects/{project_id}/testing/scenarios/{scenario_id}/run",
     response_model=RunTriggerResponse,
     tags=["testing"],
     summary="Trigger a scenario run",
     description=(
         "Starts a simulated multi-turn conversation against the real Cartesian workflow "
-        "in the background and returns immediately — poll GET /api/testing/runs/{run_id} "
+        "in the background and returns immediately — poll GET .../testing/runs/{run_id} "
         "or open its /stream to watch progress. Runs can take several minutes."
     ),
 )
-async def trigger_run(scenario_id: int, current_user: dict = Depends(db.get_current_user)):
-    scenario = await db.db_pool.fetchrow("SELECT id FROM simulation_scenarios WHERE id = $1", scenario_id)
+async def trigger_run(
+    scenario_id: int,
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
+    scenario = await db.db_pool.fetchrow(
+        "SELECT id FROM simulation_scenarios WHERE id = $1 AND project_id = $2", scenario_id, project["id"]
+    )
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found.")
 
@@ -165,7 +215,7 @@ async def trigger_run(scenario_id: int, current_user: dict = Depends(db.get_curr
         scenario_id, session_id,
     )
     run_id = row["id"]
-    logger.info("testing: triggered run_id=%s for scenario_id=%s", run_id, scenario_id)
+    logger.info("testing: triggered run_id=%s for scenario_id=%s project_id=%s", run_id, scenario_id, project["id"])
 
     # Fire-and-forget background task — same convention as
     # judge.run_judge_pipeline / cartesian's chat generation, not FastAPI
@@ -176,12 +226,16 @@ async def trigger_run(scenario_id: int, current_user: dict = Depends(db.get_curr
 
 
 @router.get(
-    "/api/testing/scenarios/{scenario_id}/runs",
+    "/api/projects/{project_id}/testing/scenarios/{scenario_id}/runs",
     response_model=RunListResponse,
     tags=["testing"],
     summary="Run history for a scenario",
 )
-async def list_scenario_runs(scenario_id: int, current_user: dict = Depends(db.get_current_user)):
+async def list_scenario_runs(
+    scenario_id: int,
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     try:
         rows = await db.db_pool.fetch(
             """
@@ -189,10 +243,10 @@ async def list_scenario_runs(scenario_id: int, current_user: dict = Depends(db.g
                    r.verdict, r.started_at, r.completed_at
             FROM simulation_runs r
             JOIN simulation_scenarios s ON s.id = r.scenario_id
-            WHERE r.scenario_id = $1
+            WHERE r.scenario_id = $1 AND s.project_id = $2
             ORDER BY r.started_at DESC
             """,
-            scenario_id,
+            scenario_id, project["id"],
         )
     except asyncpg.PostgresError as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
@@ -201,12 +255,16 @@ async def list_scenario_runs(scenario_id: int, current_user: dict = Depends(db.g
 
 
 @router.get(
-    "/api/testing/runs",
+    "/api/projects/{project_id}/testing/runs",
     response_model=RunListResponse,
     tags=["testing"],
-    summary="Most recent runs across all scenarios",
+    summary="Most recent runs across all scenarios in this project",
 )
-async def list_runs(limit: int = Query(default=50, le=200), current_user: dict = Depends(db.get_current_user)):
+async def list_runs(
+    limit: int = Query(default=50, le=200),
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     try:
         rows = await db.db_pool.fetch(
             """
@@ -214,9 +272,10 @@ async def list_runs(limit: int = Query(default=50, le=200), current_user: dict =
                    r.verdict, r.started_at, r.completed_at
             FROM simulation_runs r
             JOIN simulation_scenarios s ON s.id = r.scenario_id
-            ORDER BY r.started_at DESC LIMIT $1
+            WHERE s.project_id = $1
+            ORDER BY r.started_at DESC LIMIT $2
             """,
-            limit,
+            project["id"], limit,
         )
     except asyncpg.PostgresError as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
@@ -250,12 +309,16 @@ ORDER BY t.turn_index
 
 
 @router.get(
-    "/api/testing/runs/{run_id}",
+    "/api/projects/{project_id}/testing/runs/{run_id}",
     response_model=RunDetailResponse,
     tags=["testing"],
     summary="Run detail: scenario recap, every turn (with its raw trace, feedback, and judgment), and the verdict",
 )
-async def get_run_detail(run_id: int, current_user: dict = Depends(db.get_current_user)):
+async def get_run_detail(
+    run_id: int,
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     try:
         run = await db.db_pool.fetchrow(
             """
@@ -264,9 +327,9 @@ async def get_run_detail(run_id: int, current_user: dict = Depends(db.get_curren
                    r.verdict_reasoning, r.verdict_thinking, r.error, r.started_at, r.completed_at
             FROM simulation_runs r
             JOIN simulation_scenarios s ON s.id = r.scenario_id
-            WHERE r.id = $1
+            WHERE r.id = $1 AND s.project_id = $2
             """,
-            run_id,
+            run_id, project["id"],
         )
         if not run:
             raise HTTPException(status_code=404, detail="Run not found.")
@@ -297,9 +360,19 @@ STREAM_READ_BLOCK_MS = 5000
 STREAM_MAX_IDLE_BLOCKS = 24  # ~2 minutes of no new events before giving up on the live view — the background run itself is NOT cancelled by this
 
 
-async def _stream_run_events(run_id: int):
-    run = await db.db_pool.fetchrow("SELECT status, verdict, verdict_reasoning, error FROM simulation_runs WHERE id = $1", run_id)
-    if run and run["status"] in ("completed", "failed"):
+async def _stream_run_events(project_id: int, run_id: int):
+    run = await db.db_pool.fetchrow(
+        """
+        SELECT r.status, r.verdict, r.verdict_reasoning, r.error
+        FROM simulation_runs r JOIN simulation_scenarios s ON s.id = r.scenario_id
+        WHERE r.id = $1 AND s.project_id = $2
+        """,
+        run_id, project_id,
+    )
+    if not run:
+        yield f"data: {json.dumps({'type': 'run_error', 'detail': 'Run not found for this project.'})}\n\n"
+        return
+    if run["status"] in ("completed", "failed"):
         if run["status"] == "failed":
             yield f"data: {json.dumps({'type': 'run_error', 'detail': run['error']})}\n\n"
         else:
@@ -332,13 +405,18 @@ async def _stream_run_events(run_id: int):
 
 
 @router.get(
-    "/api/testing/runs/{run_id}/stream",
+    "/api/projects/{project_id}/testing/runs/{run_id}/stream",
     tags=["testing"],
     summary="Live SSE stream of a run's turn-by-turn progress and final verdict",
 )
-async def stream_run(run_id: int, current_user: dict = Depends(db.get_current_user_query)):
+async def stream_run(
+    project_id: int,
+    run_id: int,
+    current_user: dict = Depends(db.get_current_user_query),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     return StreamingResponse(
-        _stream_run_events(run_id),
+        _stream_run_events(project_id, run_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -347,16 +425,29 @@ async def stream_run(run_id: int, current_user: dict = Depends(db.get_current_us
 # --- Turn feedback (thumbs up/down on individual simulated responses) ---
 
 @router.post(
-    "/api/testing/turns/{turn_id}/feedback",
+    "/api/projects/{project_id}/testing/turns/{turn_id}/feedback",
     response_model=TurnFeedbackResponse,
     tags=["testing"],
     summary="Rate a simulated turn's AI response (same Layer 2 judge pipeline as real feedback)",
 )
-async def submit_turn_feedback(turn_id: int, request: TurnFeedbackRequest = Body(...), current_user: dict = Depends(db.get_current_user)):
+async def submit_turn_feedback(
+    turn_id: int,
+    request: TurnFeedbackRequest = Body(...),
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     if request.rating not in ("up", "down"):
         raise HTTPException(status_code=422, detail="rating must be 'up' or 'down'.")
 
-    turn = await db.db_pool.fetchrow("SELECT id FROM simulation_turns WHERE id = $1", turn_id)
+    turn = await db.db_pool.fetchrow(
+        """
+        SELECT t.id FROM simulation_turns t
+        JOIN simulation_runs r ON r.id = t.run_id
+        JOIN simulation_scenarios s ON s.id = r.scenario_id
+        WHERE t.id = $1 AND s.project_id = $2
+        """,
+        turn_id, project["id"],
+    )
     if not turn:
         raise HTTPException(status_code=404, detail="Turn not found.")
 
@@ -373,15 +464,26 @@ async def submit_turn_feedback(turn_id: int, request: TurnFeedbackRequest = Body
 
 
 @router.get(
-    "/api/testing/turn-feedback/{turn_feedback_id}",
+    "/api/projects/{project_id}/testing/turn-feedback/{turn_feedback_id}",
     response_model=TurnJudgmentDetailResponse,
     tags=["testing"],
     summary="Judge-only detail for one simulated-turn feedback event",
-    description="Mirrors GET /api/evals/feed/{feedback_id}'s judge fields, for the shared judge-verdict panel component.",
+    description="Mirrors GET .../evals/feed/{feedback_id}'s judge fields, for the shared judge-verdict panel component.",
 )
-async def get_turn_feedback_detail(turn_feedback_id: int, current_user: dict = Depends(db.get_current_user)):
+async def get_turn_feedback_detail(
+    turn_feedback_id: int,
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     feedback = await db.db_pool.fetchrow(
-        "SELECT id FROM simulation_turn_feedback WHERE id = $1", turn_feedback_id
+        """
+        SELECT tf.id FROM simulation_turn_feedback tf
+        JOIN simulation_turns t ON t.id = tf.turn_id
+        JOIN simulation_runs r ON r.id = t.run_id
+        JOIN simulation_scenarios s ON s.id = r.scenario_id
+        WHERE tf.id = $1 AND s.project_id = $2
+        """,
+        turn_feedback_id, project["id"],
     )
     if not feedback:
         raise HTTPException(status_code=404, detail="Turn feedback event not found.")
@@ -408,7 +510,21 @@ async def get_turn_feedback_detail(turn_feedback_id: int, current_user: dict = D
     )
 
 
-async def _stream_turn_judge_events(turn_feedback_id: int):
+async def _stream_turn_judge_events(project_id: int, turn_feedback_id: int):
+    owned = await db.db_pool.fetchrow(
+        """
+        SELECT tf.id FROM simulation_turn_feedback tf
+        JOIN simulation_turns t ON t.id = tf.turn_id
+        JOIN simulation_runs r ON r.id = t.run_id
+        JOIN simulation_scenarios s ON s.id = r.scenario_id
+        WHERE tf.id = $1 AND s.project_id = $2
+        """,
+        turn_feedback_id, project_id,
+    )
+    if not owned:
+        yield f"data: {json.dumps({'type': 'pipeline_error', 'detail': 'Turn feedback event not found for this project.'})}\n\n"
+        return
+
     already = await db.db_pool.fetchrow(
         "SELECT initial_score, corrected_score, judge_reasoning, root_cause_node, root_cause_snippet, root_cause_explanation, error "
         "FROM simulation_turn_judgments WHERE turn_feedback_id = $1",
@@ -447,13 +563,18 @@ async def _stream_turn_judge_events(turn_feedback_id: int):
 
 
 @router.get(
-    "/api/testing/turn-feedback/{turn_feedback_id}/stream",
+    "/api/projects/{project_id}/testing/turn-feedback/{turn_feedback_id}/stream",
     tags=["testing"],
     summary="Live SSE stream of the judge's thinking for one simulated-turn feedback event",
 )
-async def stream_turn_judge(turn_feedback_id: int, current_user: dict = Depends(db.get_current_user_query)):
+async def stream_turn_judge(
+    project_id: int,
+    turn_feedback_id: int,
+    current_user: dict = Depends(db.get_current_user_query),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     return StreamingResponse(
-        _stream_turn_judge_events(turn_feedback_id),
+        _stream_turn_judge_events(project_id, turn_feedback_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -462,33 +583,50 @@ async def stream_turn_judge(turn_feedback_id: int, current_user: dict = Depends(
 # --- Workflow graph (for the trace-tree UI) ---
 
 @router.get(
-    "/api/testing/workflow-graph",
+    "/api/projects/{project_id}/testing/workflow-graph",
     response_model=WorkflowGraphResponse,
     tags=["testing"],
     summary="Active workflow's nodes and edges, for rendering a turn's execution as a tree",
 )
-async def get_workflow_graph(current_user: dict = Depends(db.get_current_user)):
+async def get_workflow_graph(
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
+    # Static per active workflow version — only changes on re-ingest (a rare,
+    # deliberate action) — so a longer TTL than the other evals-cache entries
+    # is safe, matching the frontend's own 60s poll interval for this call.
+    cache_key = f"evalcache:workflow-graph:{project['id']}"
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return WorkflowGraphResponse(**cached)
+
     try:
-        nodes = await db.db_pool.fetch(
-            """
-            SELECT wn.node_id, wn.node_type, wn.alias, wn.model, wn.provider
-            FROM workflow_nodes wn
-            JOIN workflow_versions wv ON wv.id = wn.workflow_version_id
-            WHERE wv.is_active = true
-            """
-        )
-        edges = await db.db_pool.fetch(
-            """
-            SELECT we.source_node_id, we.target_node_id, we.source_handle
-            FROM workflow_edges we
-            JOIN workflow_versions wv ON wv.id = we.workflow_version_id
-            WHERE wv.is_active = true
-            """
+        nodes, edges = await asyncio.gather(
+            db.db_pool.fetch(
+                """
+                SELECT wn.node_id, wn.node_type, wn.alias, wn.model, wn.provider
+                FROM workflow_nodes wn
+                JOIN workflow_versions wv ON wv.id = wn.workflow_version_id
+                WHERE wv.is_active = true AND wv.project_id = $1
+                """,
+                project["id"],
+            ),
+            db.db_pool.fetch(
+                """
+                SELECT we.source_node_id, we.target_node_id, we.source_handle
+                FROM workflow_edges we
+                JOIN workflow_versions wv ON wv.id = we.workflow_version_id
+                WHERE wv.is_active = true AND wv.project_id = $1
+                """,
+                project["id"],
+            ),
         )
     except asyncpg.PostgresError as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
-    return WorkflowGraphResponse(
+    result = WorkflowGraphResponse(
         nodes=[WorkflowGraphNode(node_id=n["node_id"], node_type=n["node_type"], alias=n["alias"], model=n["model"], provider=n["provider"]) for n in nodes],
         edges=[WorkflowGraphEdge(source_node_id=e["source_node_id"], target_node_id=e["target_node_id"], source_handle=e["source_handle"]) for e in edges],
     )
+    await cache.set_json(cache_key, result.model_dump(), _WORKFLOW_GRAPH_CACHE_TTL)
+    return result

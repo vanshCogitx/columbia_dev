@@ -137,7 +137,7 @@ def parse_json_response(text: str) -> dict:
     return {}
 
 
-async def _build_stage_c_library_from_raw_output(raw_output: Optional[dict], trace_label: str) -> str:
+async def _build_stage_c_library_from_raw_output(raw_output: Optional[dict], trace_label: str, project_id: int) -> str:
     """Builds Stage C's agent-prompt input, narrowed to only the agents that
     actually ran for this specific response — determined from Cartesian's own
     execution trace (output.agentRawResponses), not a guess. Each included
@@ -146,7 +146,9 @@ async def _build_stage_c_library_from_raw_output(raw_output: Optional[dict], tra
     agent's prompt if raw_output is missing or has no usable agent list.
     Source-agnostic: raw_output may come from message_traces (real feedback)
     or a simulation_turns row (test feedback) — see callers below.
-    trace_label is only for logging (e.g. "message_id=123" or "turn_id=456")."""
+    trace_label is only for logging (e.g. "message_id=123" or "turn_id=456").
+    project_id scopes the prompt library to the workflow that actually
+    produced this response — see projects.py's module docstring."""
     node_outputs: dict[str, str] = {}
     if raw_output:
         for entry in raw_output.get("agentRawResponses") or []:
@@ -160,10 +162,11 @@ async def _build_stage_c_library_from_raw_output(raw_output: Optional[dict], tra
             """
             SELECT wn.node_id, wn.alias, wn.agent_instructions FROM workflow_nodes wn
             JOIN workflow_versions wv ON wv.id = wn.workflow_version_id
-            WHERE wv.is_active = true AND wn.node_type = 'agent' AND wn.agent_instructions IS NOT NULL
-              AND wn.node_id = ANY($1::text[])
+            WHERE wv.is_active = true AND wv.project_id = $1
+              AND wn.node_type = 'agent' AND wn.agent_instructions IS NOT NULL
+              AND wn.node_id = ANY($2::text[])
             """,
-            list(node_outputs.keys()),
+            project_id, list(node_outputs.keys()),
         )
         if prompt_rows:
             logger.info(
@@ -188,13 +191,15 @@ async def _build_stage_c_library_from_raw_output(raw_output: Optional[dict], tra
         """
         SELECT wn.alias, wn.agent_instructions FROM workflow_nodes wn
         JOIN workflow_versions wv ON wv.id = wn.workflow_version_id
-        WHERE wv.is_active = true AND wn.node_type = 'agent' AND wn.agent_instructions IS NOT NULL
-        """
+        WHERE wv.is_active = true AND wv.project_id = $1
+          AND wn.node_type = 'agent' AND wn.agent_instructions IS NOT NULL
+        """,
+        project_id,
     )
     return "\n\n".join(f"--- {r['alias']} ---\n{r['agent_instructions']}" for r in prompt_rows)
 
 
-async def _build_stage_c_library(message_id: int) -> str:
+async def _build_stage_c_library(message_id: int, project_id: int) -> str:
     """Real-feedback wrapper: fetches raw_output from message_traces, then
     delegates to the source-agnostic core above."""
     trace = await db.db_pool.fetchrow(
@@ -203,7 +208,7 @@ async def _build_stage_c_library(message_id: int) -> str:
     raw_output = None
     if trace and trace["raw_output"]:
         raw_output = json.loads(trace["raw_output"]) if isinstance(trace["raw_output"], str) else trace["raw_output"]
-    return await _build_stage_c_library_from_raw_output(raw_output, f"message_id={message_id}")
+    return await _build_stage_c_library_from_raw_output(raw_output, f"message_id={message_id}", project_id)
 
 
 STREAM_TTL_SECONDS = 3600  # cache hygiene only — response_judgments/simulation_turn_judgments (Postgres) are the real source of truth
@@ -366,7 +371,7 @@ async def _call_judge(
 
 async def _score_and_attribute(
     query_text: str, response_text: str, rating: Optional[str], reason: Optional[str],
-    raw_output: Optional[dict], stream_key: str, trace_label: str,
+    raw_output: Optional[dict], stream_key: str, trace_label: str, project_id: int,
 ) -> dict:
     """The shared Stage B/C core, source-agnostic: caller supplies the
     query/response/rating/reason/raw_output directly rather than this
@@ -405,7 +410,7 @@ async def _score_and_attribute(
     )
 
     if is_bad:
-        library = await _build_stage_c_library_from_raw_output(raw_output, trace_label)
+        library = await _build_stage_c_library_from_raw_output(raw_output, trace_label, project_id)
         if library:
             attribution, attribution_thinking = await _call_judge(
                 ROOT_CAUSE_SYSTEM_PROMPT,
@@ -461,7 +466,11 @@ async def run_judge_pipeline(feedback_id: int) -> None:
     stream_key = _stream_key(STREAM_PREFIX_FEEDBACK, feedback_id)
     try:
         feedback = await db.db_pool.fetchrow(
-            "SELECT id, chat_id, message_id, rating, reason FROM response_feedback WHERE id = $1",
+            """
+            SELECT rf.id, rf.chat_id, rf.message_id, rf.rating, rf.reason, rf.project_id
+            FROM response_feedback rf
+            WHERE rf.id = $1
+            """,
             feedback_id,
         )
         if not feedback:
@@ -489,7 +498,7 @@ async def run_judge_pipeline(feedback_id: int) -> None:
 
         result = await _score_and_attribute(
             query_text, response_text, feedback["rating"], feedback["reason"],
-            raw_output, stream_key, f"message_id={feedback['message_id']}",
+            raw_output, stream_key, f"message_id={feedback['message_id']}", feedback["project_id"],
         )
 
         await db.db_pool.execute(
@@ -549,7 +558,13 @@ async def run_simulation_judge_pipeline(turn_feedback_id: int) -> None:
             return
 
         turn = await db.db_pool.fetchrow(
-            "SELECT simulated_user_text, ai_response_text, raw_output FROM simulation_turns WHERE id = $1",
+            """
+            SELECT t.simulated_user_text, t.ai_response_text, t.raw_output, s.project_id
+            FROM simulation_turns t
+            JOIN simulation_runs r ON r.id = t.run_id
+            JOIN simulation_scenarios s ON s.id = r.scenario_id
+            WHERE t.id = $1
+            """,
             feedback["turn_id"],
         )
         if not turn:
@@ -563,7 +578,7 @@ async def run_simulation_judge_pipeline(turn_feedback_id: int) -> None:
         result = await _score_and_attribute(
             turn["simulated_user_text"], turn["ai_response_text"] or "",
             feedback["rating"], feedback["reason"], raw_output, stream_key,
-            f"turn_id={feedback['turn_id']}",
+            f"turn_id={feedback['turn_id']}", turn["project_id"],
         )
 
         await db.db_pool.execute(

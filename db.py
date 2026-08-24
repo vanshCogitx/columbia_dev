@@ -78,6 +78,65 @@ async def init_db(pool: asyncpg.Pool):
         await conn.execute("ALTER TABLE users ALTER COLUMN name DROP NOT NULL")
         await conn.execute("DROP TABLE IF EXISTS user_tokens")
 
+        # Multi-project support for the evals dashboard — a "project" is a
+        # distinct Cartesian workflow (its own export id + credentials).
+        # Deliberately independent of the live chat pipeline: chats/messages
+        # (below) NEVER reference projects in any way, so an empty or
+        # mid-edit projects table can never block real chat traffic. Only
+        # things a human explicitly creates for a specific project (ingested
+        # workflow versions, testing scenarios, and is_live below) are
+        # allowed to depend on a project row existing.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            cartesian_export_id TEXT NOT NULL,
+            cartesian_client_id TEXT NOT NULL,
+            cartesian_client_secret TEXT NOT NULL,
+            cartesian_base_url TEXT,
+            created_by_user_id INTEGER REFERENCES users(id),
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+        """)
+        # Exactly one project may be "the live one" at a time — the project
+        # whose workflow real Columbia chat traffic actually runs against.
+        # This is a separate concept from workflow_versions.is_active (which
+        # is scoped per-project, for that project's own prompt library) —
+        # is_live identifies which *project* backs live chat, for attributing
+        # real feedback (see response_feedback.project_id below). Nullable by
+        # nature of being a plain boolean column — never blocks anything.
+        await conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_live BOOLEAN NOT NULL DEFAULT false")
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_one_live ON projects ((is_live)) WHERE is_live = true"
+        )
+        # Seed the one project that already exists today, from the same env
+        # vars/constant the (untouched) live chat pipeline already uses, and
+        # mark it live — so real feedback has somewhere to attribute to out
+        # of the box. Purely a convenience seed, not a requirement: chats
+        # work fine even if this project (or any project) doesn't exist.
+        await conn.execute(
+            """
+            INSERT INTO projects (name, cartesian_export_id, cartesian_client_id, cartesian_client_secret, cartesian_base_url, is_live)
+            SELECT 'Columbia Sportswear', $1, $2, $3, $4, true
+            WHERE NOT EXISTS (SELECT 1 FROM projects WHERE name = 'Columbia Sportswear')
+            """,
+            "6a798ee58953bade21e86591",  # matches cartesian.CARTESIAN_JOB_PATH's export id at the time of this migration
+            os.getenv("CARTESIAN_CLIENT_ID"),
+            os.getenv("CARTESIAN_CLIENT_SECRET"),
+            os.getenv("CARTESIAN_BASE_URL"),
+        )
+        # If nothing is marked live yet (e.g. the seed above didn't fire
+        # because a differently-named project already existed), fall back to
+        # the earliest-created project — keeps get_live_project_id() usable
+        # without forcing a manual step on every fresh environment.
+        await conn.execute(
+            """
+            UPDATE projects SET is_live = true
+            WHERE id = (SELECT id FROM projects ORDER BY id ASC LIMIT 1)
+            AND NOT EXISTS (SELECT 1 FROM projects WHERE is_live = true)
+            """
+        )
+
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS chats (
             id SERIAL PRIMARY KEY,
@@ -112,7 +171,55 @@ async def init_db(pool: asyncpg.Pool):
             created_at TIMESTAMPTZ DEFAULT now()
         )
         """)
+        # Nullable, unrelated to chats/messages' own schema — set once at
+        # INSERT time (see routers/chat.py's post_feedback) to whichever
+        # project was is_live=true at that moment. A point-in-time snapshot,
+        # not a live lookup: if the live project changes later, past feedback
+        # still correctly reflects which project was actually live when it
+        # happened. Never NOT NULL — a feedback row with no resolvable live
+        # project at insert time just leaves this NULL and still saves fine.
+        await conn.execute("ALTER TABLE response_feedback ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_project ON response_feedback(project_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_message ON response_feedback(message_id)")
+
+        # HITL (Human-in-the-loop) review — a second, independent opinion on
+        # a feedback event, alongside (not overriding) the LLM judge's
+        # response_judgments. No row exists until a human actually submits a
+        # review — same "absence means not yet done" convention as
+        # response_judgments, not a pre-created 'pending' placeholder.
+        # One row per feedback_id for now (the UNIQUE constraint below) —
+        # only one reviewer's verdict is kept. reviewer_user_id is still a
+        # real column today so that when role-based, multi-reviewer access
+        # lands later, the only schema change needed is relaxing that UNIQUE
+        # to (feedback_id, reviewer_user_id) — this table doesn't need to be
+        # redesigned for it.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS response_human_reviews (
+            id SERIAL PRIMARY KEY,
+            feedback_id INTEGER NOT NULL UNIQUE REFERENCES response_feedback(id) ON DELETE CASCADE,
+            reviewer_user_id INTEGER NOT NULL REFERENCES users(id),
+            reason_valid BOOLEAN NOT NULL,
+            score REAL,
+            notes TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+        """)
+
+        # Hybrid — a lightweight sign-off, not a computed blended score (per
+        # the product decision): a human looks at the LLM judge's score and
+        # the HITL reviewer's score side by side and approves the pair. Only
+        # ever meaningful for a feedback event that already has both (see
+        # routers/hybrid.py's feed query) — this table doesn't duplicate
+        # either score, just records that someone signed off. Same
+        # no-row-until-done convention as the other two.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS hybrid_approvals (
+            id SERIAL PRIMARY KEY,
+            feedback_id INTEGER NOT NULL UNIQUE REFERENCES response_feedback(id) ON DELETE CASCADE,
+            approved_by_user_id INTEGER NOT NULL REFERENCES users(id),
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+        """)
 
         # Evals system: static reference copy of the Cartesian workflow's own
         # node definitions (prompts, model config, graph edges), imported from
@@ -131,6 +238,12 @@ async def init_db(pool: asyncpg.Pool):
             imported_at TIMESTAMPTZ DEFAULT now()
         )
         """)
+        await conn.execute("ALTER TABLE workflow_versions ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)")
+        await conn.execute(
+            "UPDATE workflow_versions SET project_id = (SELECT id FROM projects ORDER BY id LIMIT 1) WHERE project_id IS NULL"
+        )
+        await conn.execute("ALTER TABLE workflow_versions ALTER COLUMN project_id SET NOT NULL")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_versions_project ON workflow_versions(project_id)")
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS workflow_nodes (
             id SERIAL PRIMARY KEY,
@@ -227,6 +340,17 @@ async def init_db(pool: asyncpg.Pool):
             created_at TIMESTAMPTZ DEFAULT now()
         )
         """)
+        # This one is load-bearing (unlike response_feedback.project_id
+        # above, which is just an attribution snapshot) — Testing actually
+        # calls Cartesian using this project's own credentials (see
+        # simulation.py), not the global env vars. Safe to require: only
+        # ever written by an explicit "create scenario for project X" action.
+        await conn.execute("ALTER TABLE simulation_scenarios ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)")
+        await conn.execute(
+            "UPDATE simulation_scenarios SET project_id = (SELECT id FROM projects ORDER BY id LIMIT 1) WHERE project_id IS NULL"
+        )
+        await conn.execute("ALTER TABLE simulation_scenarios ALTER COLUMN project_id SET NOT NULL")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_scenarios_project ON simulation_scenarios(project_id)")
 
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS simulation_runs (

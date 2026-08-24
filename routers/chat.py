@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 import db
 import cartesian
 import judge
+import projects as projects_module
 from models import (
     ChatResponseModel, ChatHistoryMessage, ChatHistoryResponse, ChatMessageRequest,
     SessionProductsResponse, CartesianChatRequest, FeedbackRequest, FeedbackResponse,
@@ -358,9 +359,14 @@ async def post_feedback(request: FeedbackRequest = Body(...), current_user: dict
     if not owner_row:
         raise HTTPException(status_code=404, detail="Message not found or access denied.")
 
+    # Point-in-time snapshot of whichever project is live right now — not a
+    # live lookup at read time, so this feedback stays correctly attributed
+    # even if the live project changes later. None is fine (just leaves this
+    # feedback unattributed) — never blocks the insert.
+    live_project_id = await projects_module.get_live_project_id()
     row = await db.db_pool.fetchrow(
-        "INSERT INTO response_feedback (chat_id, message_id, rating, reason) VALUES ($1, $2, $3, $4) RETURNING id",
-        owner_row["chat_id"], request.message_id, request.rating, request.reason,
+        "INSERT INTO response_feedback (chat_id, message_id, rating, reason, project_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        owner_row["chat_id"], request.message_id, request.rating, request.reason, live_project_id,
     )
     feedback_id = row["id"]
     logger.info("feedback: id=%s message_id=%s rating=%s", feedback_id, request.message_id, request.rating)

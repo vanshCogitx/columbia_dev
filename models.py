@@ -118,6 +118,128 @@ class EvalsStatsResponse(BaseModel):
     avg_score: Optional[float] = None
     top_root_causes: List[EvalsRootCauseCount]
 
+# --- HITL (Human-in-the-loop review) Schemas ---
+# A second, independent opinion on a feedback event, alongside (not
+# overriding) the LLM judge — see db.py's response_human_reviews comment.
+
+class HitlFeedItem(BaseModel):
+    feedback_id: int
+    created_at: str
+    rating: str
+    reason: Optional[str] = None
+    query: Optional[str] = None
+    response_snippet: Optional[str] = None
+    reviewed: bool
+    reason_valid: Optional[bool] = None
+    score: Optional[float] = None
+
+class HitlFeedResponse(BaseModel):
+    items: List[HitlFeedItem]
+
+class HitlDetailResponse(BaseModel):
+    feedback_id: int
+    chat_id: int
+    message_id: int
+    rating: str
+    reason: Optional[str] = None
+    created_at: str
+    query: Optional[str] = None
+    response: Optional[str] = None
+    reviewed: bool
+    reviewed_at: Optional[str] = None
+    reviewer_name: Optional[str] = None
+    reason_valid: Optional[bool] = None
+    score: Optional[float] = None
+    notes: Optional[str] = None
+
+class HitlReviewRequest(BaseModel):
+    reason_valid: bool
+    score: Optional[float] = Field(None, ge=0, le=1)
+    notes: Optional[str] = None
+
+class HitlReviewResponse(BaseModel):
+    feedback_id: int
+    reason_valid: bool
+    score: Optional[float] = None
+    notes: Optional[str] = None
+    reviewed_at: str
+
+# --- Hybrid (LLM + human side-by-side sign-off) Schemas ---
+# Only ever meaningful for a feedback event that has both an LLM verdict
+# (response_judgments) and a HITL review (response_human_reviews) — see
+# routers/hybrid.py's feed query. Approving is a lightweight sign-off, not a
+# computed blended score — see db.py's hybrid_approvals comment.
+
+class HybridFeedItem(BaseModel):
+    feedback_id: int
+    created_at: str
+    rating: str
+    query: Optional[str] = None
+    response_snippet: Optional[str] = None
+    llm_score: Optional[float] = None
+    human_score: Optional[float] = None
+    human_reason_valid: Optional[bool] = None
+    approved: bool
+
+class HybridFeedResponse(BaseModel):
+    items: List[HybridFeedItem]
+
+class HybridDetailResponse(BaseModel):
+    feedback_id: int
+    chat_id: int
+    message_id: int
+    rating: str
+    reason: Optional[str] = None
+    created_at: str
+    query: Optional[str] = None
+    response: Optional[str] = None
+    llm_score: Optional[float] = None
+    llm_reasoning: Optional[str] = None
+    root_cause_node: Optional[str] = None
+    human_score: Optional[float] = None
+    human_reason_valid: Optional[bool] = None
+    human_notes: Optional[str] = None
+    human_reviewer_name: Optional[str] = None
+    approved: bool
+    approved_by: Optional[str] = None
+    approved_at: Optional[str] = None
+
+class HybridApproveResponse(BaseModel):
+    feedback_id: int
+    approved_by: str
+    approved_at: str
+
+# --- Traceability Schemas ---
+# Execution trace (which workflow nodes ran, and each one's raw output) for
+# a real chat query — same underlying data (message_traces, saved at
+# generation time) and same TraceTree.jsx component already used by Testing,
+# just for real feedback-attached queries instead of simulated turns. Scoped
+# to response_feedback (all ratings, not just thumbs-down) because chats/
+# messages carry no project_id of their own — response_feedback.project_id
+# is the only place a query is ever attributed to a project at all.
+
+class TraceabilityFeedItem(BaseModel):
+    feedback_id: int
+    created_at: str
+    rating: str
+    query: Optional[str] = None
+    response_snippet: Optional[str] = None
+    has_trace: bool
+    node_count: Optional[int] = None
+
+class TraceabilityFeedResponse(BaseModel):
+    items: List[TraceabilityFeedItem]
+
+class TraceabilityDetailResponse(BaseModel):
+    feedback_id: int
+    rating: str
+    created_at: str
+    query: Optional[str] = None
+    response: Optional[str] = None
+    has_trace: bool
+    raw_output: Optional[dict] = None
+    execution_summary: Optional[dict] = None
+
 # --- Testing (Simulation) Schemas ---
 # Proactive scenario testing: an LLM plays a simulated shopper against the
 # real Cartesian workflow for several turns, scored against success criteria.
@@ -233,6 +355,22 @@ class WorkflowGraphEdge(BaseModel):
 class WorkflowGraphResponse(BaseModel):
     nodes: List[WorkflowGraphNode]
     edges: List[WorkflowGraphEdge]
+
+# --- Projects (evals dashboard multi-project support) ---
+# Never includes cartesian_client_id/cartesian_client_secret in any response.
+
+class ProjectResponse(BaseModel):
+    id: int
+    name: str
+    cartesian_export_id: str
+    cartesian_base_url: Optional[str] = None
+    is_live: bool = False
+    created_at: str
+    node_count: int = 0
+    edge_count: int = 0
+
+class ProjectListResponse(BaseModel):
+    items: List[ProjectResponse]
 
 class SessionProductsResponse(BaseModel):
     session_id: str
