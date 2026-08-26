@@ -80,7 +80,7 @@ def _otp_email_html(otp: str) -> str:
       <div style="height:4px; background-color:#7c3aed;"></div>
       <div style="background-color:#0d0d12; padding:32px;">
         <div style="color:#a78bfa; font-size:12px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; margin-bottom:10px;">
-          Security Code
+          Login Verification
         </div>
         <div style="color:#ffffff; font-size:28px; font-weight:700; margin-bottom:18px;">
           Your login code
