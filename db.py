@@ -60,9 +60,24 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
     return api_key
 
 
+_INIT_DB_LOCK_KEY = 727001  # arbitrary constant, just needs to be stable across deploys
+
 async def init_db(pool: asyncpg.Pool):
     logger.info("Initializing Postgres (Supabase) database tables...")
     async with pool.acquire() as conn:
+        # gunicorn boots several worker processes, each running this same
+        # lifespan startup independently — without a lock, two workers can
+        # both pass a CREATE ... IF NOT EXISTS's existence check before
+        # either commits, and one gets a genuine UniqueViolationError from
+        # Postgres's own catalog constraint despite the IF NOT EXISTS
+        # (observed in production: two workers raced on the same CREATE
+        # INDEX and one crashed, taking the whole app down until gunicorn
+        # restarted it). This serializes every worker's migration behind a
+        # session-level advisory lock — whoever gets there first runs it,
+        # the rest just wait, then find everything already there. No
+        # explicit unlock needed: if migration fails and the worker exits,
+        # its connection (and the lock with it) dies along with it.
+        await conn.execute("SELECT pg_advisory_lock($1)", _INIT_DB_LOCK_KEY)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -490,6 +505,7 @@ async def init_db(pool: asyncpg.Pool):
                 "INSERT INTO users (email, name) VALUES ($1, $2)",
                 "vansh@cogitx.ai", "Vansh",
             )
+        await conn.execute("SELECT pg_advisory_unlock($1)", _INIT_DB_LOCK_KEY)
     logger.info("Postgres tables ready.")
 
 
