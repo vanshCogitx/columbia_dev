@@ -1,4 +1,5 @@
 import json
+import logging
 
 from fastapi import APIRouter, Body, Depends
 
@@ -6,6 +7,8 @@ import db
 from models import (
     CartSaveRequest, CartResponse, WishlistSaveRequest, WishlistResponse,
 )
+
+logger = logging.getLogger("columbia_backend")
 
 router = APIRouter()
 
@@ -77,7 +80,12 @@ async def save_cart(body: CartSaveRequest = Body(...)):
         if dumped["originalPrice"] is None:
             dumped["originalPrice"] = dumped["price"]
         items.append(dumped)
-    return await _save_items("carts", body.email.strip().lower(), items)
+    result = await _save_items("carts", body.email.strip().lower(), items)
+    logger.info(
+        "cart: PUT (full replace) email=%s incoming_items=%d -> result_items=%d",
+        body.email.strip().lower(), len(items), len(result["items"]),
+    )
+    return result
 
 
 @router.patch(
@@ -95,7 +103,12 @@ async def add_to_cart(body: CartSaveRequest = Body(...)):
         if dumped["originalPrice"] is None:
             dumped["originalPrice"] = dumped["price"]
         items.append(dumped)
-    return await _merge_items("carts", body.email.strip().lower(), items)
+    result = await _merge_items("carts", body.email.strip().lower(), items)
+    logger.info(
+        "cart: PATCH (merge) email=%s incoming_items=%d -> result_items=%d",
+        body.email.strip().lower(), len(items), len(result["items"]),
+    )
+    return result
 
 
 @router.delete(
@@ -106,7 +119,12 @@ async def add_to_cart(body: CartSaveRequest = Body(...)):
     summary="Delete cart item",
 )
 async def delete_cart_item(item_id: str, email: str):
-    return await _remove_item("carts", email.strip().lower(), item_id)
+    result = await _remove_item("carts", email.strip().lower(), item_id)
+    logger.info(
+        "cart: DELETE item email=%s item_id=%s -> result_items=%d",
+        email.strip().lower(), item_id, len(result["items"]),
+    )
+    return result
 
 
 @router.delete(
@@ -117,6 +135,7 @@ async def delete_cart_item(item_id: str, email: str):
     summary="Clear cart",
 )
 async def clear_cart(email: str):
+    logger.info("cart: DELETE (clear) email=%s", email.strip().lower())
     return await _save_items("carts", email.strip().lower(), [])
 
 

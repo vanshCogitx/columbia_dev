@@ -204,6 +204,22 @@ def _extract_structured_obj(ai_text: str) -> Optional[dict]:
     return obj
 
 
+def _is_in_stock(product: dict) -> bool:
+    """An out-of-stock item is still a real, valid product entry (Cartesian
+    just flags it) — it should be the ONE thing omitted from a list, never
+    a reason to drop the whole list. Checks 'in_stock' first (the more
+    reliable boolean when present), falls back to the 'availability'
+    string; defaults to keeping the item if neither field is present,
+    rather than hiding something we can't actually confirm is out of stock."""
+    in_stock = product.get("in_stock")
+    if isinstance(in_stock, bool):
+        return in_stock
+    availability = product.get("availability")
+    if isinstance(availability, str):
+        return availability.strip().lower() != "out_of_stock"
+    return True
+
+
 def _iter_product_groups(products) -> list[tuple[Optional[str], Optional[str], list]]:
     """Yields (product_type, title, flat_product_list) triples so the caller
     can stream each group as its own product_discovery event with a plain
@@ -212,7 +228,8 @@ def _iter_product_groups(products) -> list[tuple[Optional[str], Optional[str], l
     separately as a message right before that group's products. Handles
     both the grouped shape ([{"product_type", "title", "products": [...]},
     ...]) and an already-flat list of product dicts (e.g. budget intent,
-    post-_flatten_products)."""
+    post-_flatten_products). Out-of-stock items are filtered out here, per
+    item — not by dropping the group/list they came in — see _is_in_stock."""
     if not isinstance(products, list) or not products:
         return []
     if isinstance(products[0], dict) and isinstance(products[0].get("products"), list):
@@ -222,13 +239,13 @@ def _iter_product_groups(products) -> list[tuple[Optional[str], Optional[str], l
                 continue
             ptype = group.get("product_type")
             title = group.get("title")
-            items = [p for p in group.get("products", []) if isinstance(p, dict)]
+            items = [p for p in group.get("products", []) if isinstance(p, dict) and _is_in_stock(p)]
             if ptype:
                 for item in items:
                     item.setdefault("product_type", ptype)
             groups.append((ptype, title, items))
         return groups
-    return [(None, None, [p for p in products if isinstance(p, dict)])]
+    return [(None, None, [p for p in products if isinstance(p, dict) and _is_in_stock(p)])]
 
 
 def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], Optional[str], list]], list[str], Optional[dict]]:
