@@ -485,7 +485,7 @@ async def _generate_and_save_response(
             "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d type=%r",
             len(head), len(groups), product_count, len(tail), response_type,
         )
-        return {"head": head, "groups": groups, "tail": tail, "type": response_type}
+        return {"head": head, "groups": groups, "tail": tail, "type": response_type, "message_id": ai_msg_row["id"]}
     except Exception as e:
         # Belt-and-braces: this runs detached from any client connection, so
         # an unhandled exception here would otherwise just vanish into an
@@ -592,6 +592,13 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
             tail_text = " ".join(tail)
             yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
         yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
+        # The real, saved database id of the AI message just generated — sent
+        # as its own event so the frontend has a real id to attach to this
+        # message (e.g. for the thumbs up/down feedback call) instead of having
+        # to fabricate a client-side placeholder (a real bug this was tracked
+        # down from: the frontend was sending a Date.now() timestamp as
+        # message_id, which crashed POST /api/chats/feedback's int4 column).
+        yield f"event: msg_id\ndata: {json.dumps({'v': result['message_id']})}\n\n"
         yield f"event: end\ndata: {json.dumps({'v': {}})}\n\n"
         logger.info("chat_message: stream complete (add_to_cart) chat_id=%s session_id=%s", chat_id, session_id)
         return
@@ -611,5 +618,12 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
 
     yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
+    # The real, saved database id of the AI message just generated — sent
+    # as its own event so the frontend has a real id to attach to this
+    # message (e.g. for the thumbs up/down feedback call) instead of having
+    # to fabricate a client-side placeholder (a real bug this was tracked
+    # down from: the frontend was sending a Date.now() timestamp as
+    # message_id, which crashed POST /api/chats/feedback's int4 column).
+    yield f"event: msg_id\ndata: {json.dumps({'v': result['message_id']})}\n\n"
     yield f"event: end\ndata: {json.dumps({'v': {}})}\n\n"
     logger.info("chat_message: stream complete chat_id=%s session_id=%s", chat_id, session_id)

@@ -59,7 +59,12 @@ class ChatMessageRequest(BaseModel):
     text: str
 
 class FeedbackRequest(BaseModel):
-    message_id: int = Field(..., description="ID of the AI message being rated (from ChatHistoryMessage, not exposed today — see note in the endpoint).")
+    # le=2147483647 is Postgres's int4 max — messages.id is a SERIAL (int4)
+    # column. Without this bound, a caller sending a JS-style millisecond
+    # timestamp instead of a real message id (a real, observed frontend bug)
+    # sails through validation and crashes asyncpg with an unhandled
+    # OverflowError deep in the DB driver instead of failing cleanly here.
+    message_id: int = Field(..., ge=1, le=2147483647, description="ID of the AI message being rated (from ChatHistoryMessage, not exposed today — see note in the endpoint).")
     rating: str = Field(..., description="'up' or 'down'.")
     reason: Optional[str] = Field(None, description="Optional free-text reason, mainly useful for 'down' ratings.")
 
