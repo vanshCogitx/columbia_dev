@@ -14,7 +14,7 @@ import db
 
 logger = logging.getLogger("columbia_backend")
 
-CARTESIAN_JOB_PATH = "/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs"
+CARTESIAN_JOB_PATH = "/exports/rest-api/6a798ee58953bade21e86591/jobs"
 STATUS_MESSAGES = [
     "Thinking...",
     "Searching the catalog...",
@@ -66,7 +66,7 @@ def _product_widget_marker(index: int) -> str:
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
-_NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType"}
+_NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType", "type"}
 
 
 def _extract_ai_text(output_obj: dict) -> Optional[str]:
@@ -204,6 +204,22 @@ def _extract_structured_obj(ai_text: str) -> Optional[dict]:
     return obj
 
 
+def _is_in_stock(product: dict) -> bool:
+    """An out-of-stock item is still a real, valid product entry (Cartesian
+    just flags it) — it should be the ONE thing omitted from a list, never
+    a reason to drop the whole list. Checks 'in_stock' first (the more
+    reliable boolean when present), falls back to the 'availability'
+    string; defaults to keeping the item if neither field is present,
+    rather than hiding something we can't actually confirm is out of stock."""
+    in_stock = product.get("in_stock")
+    if isinstance(in_stock, bool):
+        return in_stock
+    availability = product.get("availability")
+    if isinstance(availability, str):
+        return availability.strip().lower() != "out_of_stock"
+    return True
+
+
 def _iter_product_groups(products) -> list[tuple[Optional[str], Optional[str], list]]:
     """Yields (product_type, title, flat_product_list) triples so the caller
     can stream each group as its own product_discovery event with a plain
@@ -212,7 +228,8 @@ def _iter_product_groups(products) -> list[tuple[Optional[str], Optional[str], l
     separately as a message right before that group's products. Handles
     both the grouped shape ([{"product_type", "title", "products": [...]},
     ...]) and an already-flat list of product dicts (e.g. budget intent,
-    post-_flatten_products)."""
+    post-_flatten_products). Out-of-stock items are filtered out here, per
+    item — not by dropping the group/list they came in — see _is_in_stock."""
     if not isinstance(products, list) or not products:
         return []
     if isinstance(products[0], dict) and isinstance(products[0].get("products"), list):
@@ -222,13 +239,13 @@ def _iter_product_groups(products) -> list[tuple[Optional[str], Optional[str], l
                 continue
             ptype = group.get("product_type")
             title = group.get("title")
-            items = [p for p in group.get("products", []) if isinstance(p, dict)]
+            items = [p for p in group.get("products", []) if isinstance(p, dict) and _is_in_stock(p)]
             if ptype:
                 for item in items:
                     item.setdefault("product_type", ptype)
             groups.append((ptype, title, items))
         return groups
-    return [(None, None, [p for p in products if isinstance(p, dict)])]
+    return [(None, None, [p for p in products if isinstance(p, dict) and _is_in_stock(p)])]
 
 
 def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], Optional[str], list]], list[str], Optional[dict]]:
@@ -461,13 +478,14 @@ async def _generate_and_save_response(
         )
         await _save_message_trace(ai_msg_row["id"], raw_output)
 
-        head, groups, tail, _obj = _parse_ai_response_parts(ai_text)
+        head, groups, tail, obj = _parse_ai_response_parts(ai_text)
         product_count = sum(len(items) for _, _, items in groups)
+        response_type = obj.get("type") if obj else None
         logger.info(
-            "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d",
-            len(head), len(groups), product_count, len(tail),
+            "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d type=%r",
+            len(head), len(groups), product_count, len(tail), response_type,
         )
-        return {"head": head, "groups": groups, "tail": tail}
+        return {"head": head, "groups": groups, "tail": tail, "type": response_type}
     except Exception as e:
         # Belt-and-braces: this runs detached from any client connection, so
         # an unhandled exception here would otherwise just vanish into an
@@ -552,6 +570,32 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         return
 
     head, groups, tail = result["head"], result["groups"], result["tail"]
+
+    # add_to_cart is a distinct UX moment (confirming items just added):
+    # the confirmation text goes out as its own add_to_cart event, and the
+    # items themselves reuse the normal product_discovery event/shape —
+    # same as any other product-bearing reply — so the frontend renders
+    # them with its existing product widget. Everything else (including
+    # out_of_scope) falls through to the normal narrative + product_discovery
+    # streaming below, unchanged.
+    if result.get("type") == "add_to_cart":
+        message = " ".join(head) if head else None
+        yield f"event: add_to_cart\ndata: {json.dumps({'v': {'message': message}})}\n\n"
+        for _product_type, group_title, items in groups:
+            if items:
+                if group_title:
+                    title_text = f"\n\n**{group_title}**"
+                    yield f"event: message\ndata: {json.dumps({'v': title_text})}\n\n"
+                yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
+                await _cache_session_products(session_id, items)
+        if tail:
+            tail_text = " ".join(tail)
+            yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
+        yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
+        yield f"event: end\ndata: {json.dumps({'v': {}})}\n\n"
+        logger.info("chat_message: stream complete (add_to_cart) chat_id=%s session_id=%s", chat_id, session_id)
+        return
+
     if head:
         head_text = " ".join(head)
         yield f"event: message\ndata: {json.dumps({'v': head_text})}\n\n"

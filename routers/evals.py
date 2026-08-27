@@ -1,14 +1,17 @@
 import os
 import json
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 import asyncpg
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 
+import cache
 import db
+import projects as projects_module
 from models import (
     EvalsFeedResponse, EvalsFeedItem, EvalsDetailResponse,
     EvalsStatsResponse, EvalsRootCauseCount,
@@ -18,6 +21,13 @@ logger = logging.getLogger("columbia_backend")
 
 router = APIRouter()
 
+# Short TTL, no explicit invalidation on new feedback/judgments — these are
+# already polled every few seconds by the dashboard (a few seconds of
+# staleness is the existing UX, not a regression), and invalidating on every
+# feedback/judgment write would mean tracking which project's cache to bust
+# from judge.py too. See cache.py's module docstring.
+_EVALS_CACHE_TTL = 5
+
 _DASHBOARD_HTML_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static", "evals_dashboard.html")
 
 
@@ -26,11 +36,16 @@ async def get_evals_dashboard():
     with open(_DASHBOARD_HTML_PATH) as f:
         return HTMLResponse(content=f.read())
 
-# Prototype scope, deliberately not gated behind the customer-facing JWT login
-# (see routers/chat.py's get_current_user) — this is an internal panel over
-# response_feedback/response_judgments, read-only, no customer PII beyond
-# what's already in those tables. Add real access control before this is
-# ever exposed outside a trusted network.
+# Gated behind the same JWT login as the customer-facing app (see
+# db.get_current_user) — the evals dashboard now has its own standalone login
+# screen hitting the same /api/auth/* endpoints, not a separate auth system.
+# The 2 SSE endpoints below use get_current_user_query instead, since
+# EventSource can't set an Authorization header.
+#
+# Every endpoint here is scoped to a project (see projects.py) via a
+# /api/projects/{project_id}/evals/... path prefix, and uses
+# Depends(projects_module.get_project_or_404) to 404 early on a bad
+# project_id before any downstream query runs.
 
 _RESPONSE_SNIPPET_LEN = 200
 
@@ -41,6 +56,9 @@ def _to_iso(ts: datetime) -> str:
     return ts.isoformat()
 
 
+# rf.project_id is a point-in-time snapshot taken at feedback-creation time
+# (see routers/chat.py's post_feedback / projects.get_live_project_id) —
+# filtering on it directly here, no join through chats needed.
 _FEED_QUERY = """
 SELECT
     rf.id AS feedback_id,
@@ -70,11 +88,12 @@ SELECT
 FROM response_feedback rf
 JOIN messages ai_msg ON ai_msg.id = rf.message_id
 LEFT JOIN response_judgments rj ON rj.feedback_id = rf.id
+WHERE rf.project_id = $1
 """
 
 
 @router.get(
-    "/api/evals/feed",
+    "/api/projects/{project_id}/evals/feed",
     response_model=EvalsFeedResponse,
     tags=["evals"],
     summary="Live feed of feedback events (evals dashboard)",
@@ -83,9 +102,18 @@ LEFT JOIN response_judgments rj ON rj.feedback_id = rf.id
         "finished scoring yet (judged=false). Poll this for a live-updating feed."
     )
 )
-async def get_evals_feed(limit: int = Query(default=50, le=200)):
+async def get_evals_feed(
+    limit: int = Query(default=50, le=200),
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
+    cache_key = f"evalcache:evals-feed:{project['id']}:{limit}"
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return EvalsFeedResponse(**cached)
+
     try:
-        rows = await db.db_pool.fetch(_FEED_QUERY + " ORDER BY rf.created_at DESC LIMIT $1", limit)
+        rows = await db.db_pool.fetch(_FEED_QUERY + " ORDER BY rf.created_at DESC LIMIT $2", project["id"], limit)
     except asyncpg.PostgresError as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
@@ -105,19 +133,25 @@ async def get_evals_feed(limit: int = Query(default=50, le=200)):
             root_cause_node=r["root_cause_node"],
             error=r["error"],
         ))
-    return EvalsFeedResponse(items=items)
+    result = EvalsFeedResponse(items=items)
+    await cache.set_json(cache_key, result.model_dump(), _EVALS_CACHE_TTL)
+    return result
 
 
 @router.get(
-    "/api/evals/feed/{feedback_id}",
+    "/api/projects/{project_id}/evals/feed/{feedback_id}",
     response_model=EvalsDetailResponse,
     tags=["evals"],
     summary="Full detail for one feedback event (evals dashboard)",
     description="Complete query, response, feedback reason, judge scores, and the judge's raw reasoning per stage."
 )
-async def get_evals_detail(feedback_id: int):
+async def get_evals_detail(
+    feedback_id: int,
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     try:
-        row = await db.db_pool.fetchrow(_FEED_QUERY + " WHERE rf.id = $1", feedback_id)
+        row = await db.db_pool.fetchrow(_FEED_QUERY + " AND rf.id = $2", project["id"], feedback_id)
     except asyncpg.PostgresError as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
@@ -152,7 +186,7 @@ STREAM_READ_BLOCK_MS = 5000
 STREAM_MAX_IDLE_BLOCKS = 24  # ~2 minutes total of no new messages before giving up on the live view (the background judge task itself is NOT cancelled by this — reopening the event later will show its real result once it lands)
 
 
-async def _stream_judge_events(feedback_id: int):
+async def _stream_judge_events(project_id: int, feedback_id: int):
     # Already judged (either a normal completed run, or the client
     # reconnected well after the fact) — there's nothing live to stream.
     # Synthesize a single final event straight from the DB and close,
@@ -161,7 +195,10 @@ async def _stream_judge_events(feedback_id: int):
         "SELECT id FROM response_judgments WHERE feedback_id = $1", feedback_id
     )
     if already:
-        row = await db.db_pool.fetchrow(_FEED_QUERY + " WHERE rf.id = $1", feedback_id)
+        row = await db.db_pool.fetchrow(_FEED_QUERY + " AND rf.id = $2", project_id, feedback_id)
+        if not row:
+            yield f"data: {json.dumps({'type': 'pipeline_error', 'detail': 'Feedback event not found for this project.'})}\n\n"
+            return
         if row["error"]:
             yield f"data: {json.dumps({'type': 'pipeline_error', 'detail': row['error']})}\n\n"
         else:
@@ -198,7 +235,7 @@ async def _stream_judge_events(feedback_id: int):
 
 
 @router.get(
-    "/api/evals/stream/{feedback_id}",
+    "/api/projects/{project_id}/evals/stream/{feedback_id}",
     tags=["evals"],
     summary="Live SSE stream of the judge's thinking for one feedback event",
     description=(
@@ -207,43 +244,74 @@ async def _stream_judge_events(feedback_id: int):
         "final event and closes instead of replaying the whole stream."
     )
 )
-async def stream_evals_judge(feedback_id: int):
+async def stream_evals_judge(
+    project_id: int,
+    feedback_id: int,
+    current_user: dict = Depends(db.get_current_user_query),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
     return StreamingResponse(
-        _stream_judge_events(feedback_id),
+        _stream_judge_events(project_id, feedback_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
 @router.get(
-    "/api/evals/stats",
+    "/api/projects/{project_id}/evals/stats",
     response_model=EvalsStatsResponse,
     tags=["evals"],
     summary="Aggregate stats for the evals dashboard header",
 )
-async def get_evals_stats():
+async def get_evals_stats(
+    current_user: dict = Depends(db.get_current_user),
+    project: dict = Depends(projects_module.get_project_or_404),
+):
+    cache_key = f"evalcache:evals-stats:{project['id']}"
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return EvalsStatsResponse(**cached)
+
     try:
-        counts = await db.db_pool.fetchrow(
-            """
-            SELECT
-                COUNT(*) AS total_feedback,
-                COUNT(*) FILTER (WHERE rating = 'up') AS up_count,
-                COUNT(*) FILTER (WHERE rating = 'down') AS down_count
-            FROM response_feedback
-            """
-        )
-        avg_row = await db.db_pool.fetchrow("SELECT AVG(corrected_score) AS avg_score FROM response_judgments")
-        top_causes = await db.db_pool.fetch(
-            """
-            SELECT root_cause_node, COUNT(*) AS count FROM response_judgments
-            WHERE root_cause_node IS NOT NULL
-            GROUP BY root_cause_node ORDER BY count DESC LIMIT 5
-            """
+        # Independent of each other — run concurrently rather than as 3
+        # sequential round-trips (each Postgres round-trip here costs
+        # ~200ms+ regardless of query complexity; see cache.py's docstring).
+        counts, avg_row, top_causes = await asyncio.gather(
+            db.db_pool.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS total_feedback,
+                    COUNT(*) FILTER (WHERE rf.rating = 'up') AS up_count,
+                    COUNT(*) FILTER (WHERE rf.rating = 'down') AS down_count
+                FROM response_feedback rf
+                WHERE rf.project_id = $1
+                """,
+                project["id"],
+            ),
+            db.db_pool.fetchrow(
+                """
+                SELECT AVG(rj.corrected_score) AS avg_score
+                FROM response_judgments rj
+                JOIN response_feedback rf ON rf.id = rj.feedback_id
+                WHERE rf.project_id = $1
+                """,
+                project["id"],
+            ),
+            db.db_pool.fetch(
+                """
+                SELECT rj.root_cause_node, COUNT(*) AS count
+                FROM response_judgments rj
+                JOIN response_feedback rf ON rf.id = rj.feedback_id
+                WHERE rf.project_id = $1 AND rj.root_cause_node IS NOT NULL
+                GROUP BY rj.root_cause_node ORDER BY count DESC LIMIT 5
+                """,
+                project["id"],
+            ),
         )
     except asyncpg.PostgresError as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
-    return EvalsStatsResponse(
+    result = EvalsStatsResponse(
         total_feedback=counts["total_feedback"],
         up_count=counts["up_count"],
         down_count=counts["down_count"],
@@ -252,3 +320,5 @@ async def get_evals_stats():
             EvalsRootCauseCount(root_cause_node=r["root_cause_node"], count=r["count"]) for r in top_causes
         ],
     )
+    await cache.set_json(cache_key, result.model_dump(), _EVALS_CACHE_TTL)
+    return result

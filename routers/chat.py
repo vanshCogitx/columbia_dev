@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 import db
 import cartesian
 import judge
+import projects as projects_module
 from models import (
     ChatResponseModel, ChatHistoryMessage, ChatHistoryResponse, ChatMessageRequest,
     SessionProductsResponse, CartesianChatRequest, FeedbackRequest, FeedbackResponse,
@@ -64,7 +65,7 @@ async def chat_endpoint(request: CartesianChatRequest = Body(...)):
     if request.session_id:
         params["sessionId"] = request.session_id
 
-    endpoint_path = "/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs"
+    endpoint_path = "/exports/rest-api/6a798ee58953bade21e86591/jobs"
     url = f"{base_url.rstrip('/')}{endpoint_path}"
 
     async with httpx.AsyncClient() as client:
@@ -86,7 +87,7 @@ async def chat_endpoint(request: CartesianChatRequest = Body(...)):
             if not run_id:
                 raise HTTPException(status_code=500, detail="Received accepted response but no runId")
 
-            poll_url = f"{base_url.rstrip('/')}/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs/{run_id}"
+            poll_url = f"{base_url.rstrip('/')}/exports/rest-api/6a798ee58953bade21e86591/jobs/{run_id}"
 
             # Poll until complete or timeout (e.g. 30 times with 2s delay = ~60s wait)
             max_retries = 30
@@ -229,6 +230,7 @@ async def get_chat_history(
             ))
         else:
             head, groups, tail, obj = cartesian._parse_ai_response_parts(text)
+            is_add_to_cart = bool(obj) and obj.get("type") == "add_to_cart"
             # Only groups that actually have products get a title + marker +
             # widget — matches what live streaming does (skips empty groups,
             # and sends the group's title right before its products).
@@ -237,7 +239,10 @@ async def get_chat_history(
             content_type = None
             structured_data = None
             if has_products:
-                content_type = (obj.get("intent") if obj else None) or "product_discovery"
+                # add_to_cart gets its own content_type (same widget/marker
+                # shape as any other product reply) so the frontend can
+                # still tell a cart confirmation apart from a search result.
+                content_type = "add_to_cart" if is_add_to_cart else ((obj.get("intent") if obj else None) or "product_discovery")
                 parts = []
                 if head:
                     parts.append(" ".join(head))
@@ -315,7 +320,9 @@ async def get_session_products(session_id: str, current_user: dict = Depends(db.
     description=(
         "Combines chat creation and message sending into a single streamed endpoint. "
         "Omit session_id to start a new chat; pass an existing session_id to continue it. "
-        "Streams event: chat, status, message, product_discovery (when present), conversation_id, end."
+        "Streams event: chat, status, message, product_discovery (when present), conversation_id, end. "
+        "For an add_to_cart response, message/product_discovery are replaced by a single add_to_cart "
+        "event carrying {message} instead (no product list)."
     )
 )
 async def post_chat_message(request: ChatMessageRequest = Body(...), current_user: dict = Depends(db.get_current_user)):
@@ -352,9 +359,14 @@ async def post_feedback(request: FeedbackRequest = Body(...), current_user: dict
     if not owner_row:
         raise HTTPException(status_code=404, detail="Message not found or access denied.")
 
+    # Point-in-time snapshot of whichever project is live right now — not a
+    # live lookup at read time, so this feedback stays correctly attributed
+    # even if the live project changes later. None is fine (just leaves this
+    # feedback unattributed) — never blocks the insert.
+    live_project_id = await projects_module.get_live_project_id()
     row = await db.db_pool.fetchrow(
-        "INSERT INTO response_feedback (chat_id, message_id, rating, reason) VALUES ($1, $2, $3, $4) RETURNING id",
-        owner_row["chat_id"], request.message_id, request.rating, request.reason,
+        "INSERT INTO response_feedback (chat_id, message_id, rating, reason, project_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        owner_row["chat_id"], request.message_id, request.rating, request.reason, live_project_id,
     )
     feedback_id = row["id"]
     logger.info("feedback: id=%s message_id=%s rating=%s", feedback_id, request.message_id, request.rating)

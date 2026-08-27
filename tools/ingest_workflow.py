@@ -4,12 +4,18 @@ static prompt library the Layer 2 judge (judge.py) reads from for root-cause
 attribution. Never fetched at request time; re-run this by hand whenever the
 workflow changes in Cartesian's builder and you re-export it.
 
+Requires an existing project row (create one via POST /api/projects, or
+the "New Project" form in the evals dashboard) — this script only
+(re-)ingests a workflow JSON for a project that already exists, it does not
+create projects itself.
+
 Usage:
-    python tools/ingest_workflow.py path/to/exported_workflow.json
+    python tools/ingest_workflow.py path/to/exported_workflow.json --project-id 1
 """
 import os
 import sys
 import json
+import argparse
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -27,7 +33,8 @@ def ensure_tables(conn):
         description TEXT,
         raw_json JSONB NOT NULL,
         is_active BOOLEAN NOT NULL DEFAULT true,
-        imported_at TIMESTAMPTZ DEFAULT now()
+        imported_at TIMESTAMPTZ DEFAULT now(),
+        project_id INTEGER REFERENCES projects(id)
     )
     """))
     conn.execute(text("""
@@ -56,7 +63,7 @@ def ensure_tables(conn):
     """))
 
 
-def ingest(path: str):
+def ingest(path: str, project_id: int):
     if not SUPABASE_DB_URL:
         print("ERROR: SUPABASE_DB_URL is not set in the environment or .env file.")
         sys.exit(1)
@@ -69,23 +76,35 @@ def ingest(path: str):
     name = workflow.get("name", os.path.basename(path))
     description = workflow.get("description")
 
-    print(f"Ingesting workflow '{name}' ({len(nodes)} nodes, {len(edges)} edges) from {path}...")
+    print(f"Ingesting workflow '{name}' ({len(nodes)} nodes, {len(edges)} edges) from {path} into project_id={project_id}...")
 
     engine = create_engine(SUPABASE_DB_URL)
     with engine.begin() as conn:
         ensure_tables(conn)
 
-        # Only one active version at a time — earlier imports stay in the
-        # table (never overwritten) so past prompt states remain queryable.
-        conn.execute(text("UPDATE workflow_versions SET is_active = false WHERE is_active = true"))
+        project_row = conn.execute(
+            text("SELECT id FROM projects WHERE id = :project_id"), {"project_id": project_id}
+        ).fetchone()
+        if not project_row:
+            print(f"ERROR: project_id={project_id} does not exist. Create it first via POST /api/projects.")
+            sys.exit(1)
+
+        # Only one active version per project at a time — earlier imports
+        # stay in the table (never overwritten) so past prompt states remain
+        # queryable. Scoped by project_id so ingesting one project's workflow
+        # never deactivates another project's active version.
+        conn.execute(
+            text("UPDATE workflow_versions SET is_active = false WHERE is_active = true AND project_id = :project_id"),
+            {"project_id": project_id},
+        )
 
         version_id = conn.execute(
             text("""
-                INSERT INTO workflow_versions (name, description, raw_json, is_active)
-                VALUES (:name, :description, :raw_json, true)
+                INSERT INTO workflow_versions (name, description, raw_json, is_active, project_id)
+                VALUES (:name, :description, :raw_json, true, :project_id)
                 RETURNING id
             """),
-            {"name": name, "description": description, "raw_json": json.dumps(workflow)},
+            {"name": name, "description": description, "raw_json": json.dumps(workflow), "project_id": project_id},
         ).scalar_one()
 
         for n in nodes:
@@ -131,7 +150,8 @@ def ingest(path: str):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python tools/ingest_workflow.py path/to/exported_workflow.json")
-        sys.exit(1)
-    ingest(sys.argv[1])
+    parser = argparse.ArgumentParser(description="Ingest an exported Cartesian workflow JSON for an existing project.")
+    parser.add_argument("workflow_json_path", help="Path to the exported workflow JSON.")
+    parser.add_argument("--project-id", type=int, required=True, help="Existing project id to ingest this workflow into.")
+    args = parser.parse_args()
+    ingest(args.workflow_json_path, args.project_id)
