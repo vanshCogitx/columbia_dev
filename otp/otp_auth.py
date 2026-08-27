@@ -86,7 +86,7 @@ def _otp_email_html(otp: str) -> str:
           Your login code
         </div>
         <p style="color:#a3a3b0; font-size:15px; line-height:1.5; margin:0 0 28px;">
-          Use this code to log in to your CogitX Platform account. It expires in 5 minutes.
+          Use this code to log in to your Cartesian account. It expires in 5 minutes.
         </p>
         <div style="background-color:#3a3a45; border-radius:12px; padding:24px; text-align:center; margin-bottom:28px;">
           <div style="color:#a3a3b0; font-size:12px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; margin-bottom:12px;">
@@ -121,7 +121,7 @@ def send_otp_email(otp: str, to_address: str) -> None:
     message = {
         "senderAddress": sender_address,
         "content": {
-            "subject": "Your CogitX Platform login code",
+            "subject": "Your Cartesian login code",
             "plainText": f"Your login code is: {otp}\nThis code will expire in 5 minutes.\n\nIf you didn't request this, please ignore this email.",
             "html": _otp_email_html(otp),
         },
