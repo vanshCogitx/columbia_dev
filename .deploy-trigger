@@ -1,0 +1,4 @@
+Trivial marker file — its only purpose is to trigger a push event to main
+so the "Deploy to Azure" GitHub Actions workflow fires. Safe to delete or
+touch again any time a redeploy needs to be forced without a real code
+change.
