@@ -65,7 +65,7 @@ async def chat_endpoint(request: CartesianChatRequest = Body(...)):
     if request.session_id:
         params["sessionId"] = request.session_id
 
-    endpoint_path = "/exports/rest-api/6a798ee58953bade21e86591/jobs"
+    endpoint_path = "/exports/rest-api/6a60f95529131252a1e0746a/jobs"
     url = f"{base_url.rstrip('/')}{endpoint_path}"
 
     async with httpx.AsyncClient() as client:
@@ -87,7 +87,7 @@ async def chat_endpoint(request: CartesianChatRequest = Body(...)):
             if not run_id:
                 raise HTTPException(status_code=500, detail="Received accepted response but no runId")
 
-            poll_url = f"{base_url.rstrip('/')}/exports/rest-api/6a798ee58953bade21e86591/jobs/{run_id}"
+            poll_url = f"{base_url.rstrip('/')}/exports/rest-api/6a60f95529131252a1e0746a/jobs/{run_id}"
 
             # Poll until complete or timeout (e.g. 30 times with 2s delay = ~60s wait)
             max_retries = 30

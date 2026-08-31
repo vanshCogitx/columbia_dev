@@ -14,7 +14,7 @@ import db
 
 logger = logging.getLogger("columbia_backend")
 
-CARTESIAN_JOB_PATH = "/exports/rest-api/6a798ee58953bade21e86591/jobs"
+CARTESIAN_JOB_PATH = "/exports/rest-api/6a60f95529131252a1e0746a/jobs"
 STATUS_MESSAGES = [
     "Thinking...",
     "Searching the catalog...",
