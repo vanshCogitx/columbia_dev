@@ -187,6 +187,27 @@ STREAM_MAX_IDLE_BLOCKS = 24  # ~2 minutes total of no new messages before giving
 
 
 async def _stream_judge_events(project_id: int, feedback_id: int):
+    try:
+        async for event in _stream_judge_events_inner(project_id, feedback_id):
+            yield event
+    except (asyncio.CancelledError, TimeoutError):
+        # A client closing the tab / navigating away / losing network while
+        # this generator is mid-await (almost always inside the Redis
+        # blocking xread below) cancels this task from the outside — that
+        # cancellation surfaces here as a CancelledError, or, depending on
+        # exactly where it lands inside redis-py's internal async timeout
+        # handling, a builtin TimeoutError. Neither means anything actually
+        # went wrong; it's the normal, expected way a long-lived SSE
+        # connection ends. Left uncaught, it used to bubble all the way up
+        # as an unhandled "Exception in ASGI application" with a full
+        # traceback, indistinguishable in the logs from a real crash (like
+        # the NVIDIA_API_KEY-missing case this router also has to surface
+        # clearly) — swallowing it quietly here is the actual fix, not
+        # logging it at a lower level, since it isn't an error at all.
+        return
+
+
+async def _stream_judge_events_inner(project_id: int, feedback_id: int):
     # Already judged (either a normal completed run, or the client
     # reconnected well after the fact) — there's nothing live to stream.
     # Synthesize a single final event straight from the DB and close,
