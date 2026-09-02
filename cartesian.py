@@ -65,6 +65,13 @@ def _product_widget_marker(index: int) -> str:
     return f":::PRODUCT_WIDGET_{index}:::"
 
 
+def _comparison_widget_marker() -> str:
+    """Position marker for a 'comparison' intent's comparison data in a
+    history message's text (same purpose as _product_widget_marker) — only
+    ever one comparison per message, so no index needed."""
+    return ":::PRODUCT_COMPARISON:::"
+
+
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
 _NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType", "type", "comparison"}
 

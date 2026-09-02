@@ -229,20 +229,32 @@ async def get_chat_history(
                 id=msg_id, role="user", content=text, session_id=sid, created_at=_to_iso(created_at),
             ))
         else:
-            head, groups, tail, obj = cartesian._parse_ai_response_parts(text)
+            head, groups, tail, comparison_items, obj = cartesian._parse_ai_response_parts(text)
             is_add_to_cart = bool(obj) and obj.get("type") == "add_to_cart"
             # Only groups that actually have products get a title + marker +
             # widget — matches what live streaming does (skips empty groups,
             # and sends the group's title right before its products).
             non_empty_groups = [(title, items) for _ptype, title, items in groups if items]
             has_products = bool(non_empty_groups)
+            has_comparison = bool(comparison_items)
             content_type = None
             structured_data = None
-            if has_products:
+            if has_products or has_comparison:
                 # add_to_cart gets its own content_type (same widget/marker
                 # shape as any other product reply) so the frontend can
                 # still tell a cart confirmation apart from a search result.
-                content_type = "add_to_cart" if is_add_to_cart else ((obj.get("intent") if obj else None) or "product_discovery")
+                # 'comparison' is its own distinct type too (see
+                # cartesian.py's event: comparison) — different structured_data
+                # shape than a product grid, so it can't just fall back to
+                # product_discovery the way a plain products-only reply does.
+                if is_add_to_cart:
+                    content_type = "add_to_cart"
+                elif obj and obj.get("intent"):
+                    content_type = obj.get("intent")
+                elif has_comparison:
+                    content_type = "comparison"
+                else:
+                    content_type = "product_discovery"
                 parts = []
                 if head:
                     parts.append(" ".join(head))
@@ -250,10 +262,14 @@ async def get_chat_history(
                     if title:
                         parts.append(f"**{title}**")
                     parts.append(cartesian._product_widget_marker(i))
+                if has_comparison:
+                    parts.append(cartesian._comparison_widget_marker())
                 if tail:
                     parts.append(" ".join(tail))
                 content = "\n\n".join(parts)
                 structured_data = [items for _title, items in non_empty_groups]
+                if has_comparison:
+                    structured_data.append(comparison_items)
             else:
                 content = " ".join(head + tail) or text
             messages.append(ChatHistoryMessage(
