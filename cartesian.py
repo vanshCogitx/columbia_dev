@@ -639,11 +639,19 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         logger.info("chat_message: stream complete (add_to_cart) chat_id=%s session_id=%s", chat_id, session_id)
         return
 
-    if head:
+    if comparison_items:
+        # Comparison replies read as: here are the two products, THEN the
+        # narrative ("choose X for Y, opt for Z for W" + a closing line) —
+        # comparison first matches that reading order, and every narrative
+        # field (choose, closing, ...) gets its own event: message instead
+        # of being mashed into one paragraph via " ".join, so the closing
+        # line doesn't visually disappear into the recommendation text.
+        yield f"event: comparison\ndata: {json.dumps({'v': comparison_items})}\n\n"
+        for text in head:
+            yield f"event: message\ndata: {json.dumps({'v': text})}\n\n"
+    elif head:
         head_text = " ".join(head)
         yield f"event: message\ndata: {json.dumps({'v': head_text})}\n\n"
-    if comparison_items:
-        yield f"event: comparison\ndata: {json.dumps({'v': comparison_items})}\n\n"
     for _product_type, group_title, items in groups:
         if items:
             if group_title:
@@ -652,8 +660,12 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
             yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
             await _cache_session_products(session_id, items)
     if tail:
-        tail_text = " ".join(tail)
-        yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
+        if comparison_items:
+            for text in tail:
+                yield f"event: message\ndata: {json.dumps({'v': text})}\n\n"
+        else:
+            tail_text = " ".join(tail)
+            yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
 
     yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
     # The real, saved database id of the AI message just generated — sent
