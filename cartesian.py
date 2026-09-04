@@ -109,7 +109,12 @@ async def _call_cartesian_workflow(client: httpx.AsyncClient, url: str, poll_url
         run_id = resp_data.get("runId")
         poll_url = f"{poll_url_base}/{run_id}"
         logger.info("cartesian: job accepted async, runId=%s, polling %s", run_id, poll_url)
-        max_retries = 30
+        # 60 * 2s = 120s. Was 30 (60s) — the workflow swapped in has 15-20+
+        # chained agent nodes (vs. the older, smaller one this limit was
+        # originally sized for) and some individual nodes alone take 10+
+        # seconds; 60s was observed timing out mid-execution with several
+        # nodes still QUEUED, turning "slow" into an outright failure.
+        max_retries = 60
         for attempt in range(max_retries):
             await asyncio.sleep(2)
             poll_resp = await client.get(poll_url, headers=headers, timeout=10)
