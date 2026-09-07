@@ -15,6 +15,20 @@ jobs:
       with:
         python-version: '3.11'
 
+    # Downloads the Linux x64 Chromium build here (this runner IS Linux,
+    # matching Azure App Service Linux's architecture — doing this on a
+    # non-Linux machine, e.g. a local Mac, downloads the wrong OS build).
+    # PLAYWRIGHT_BROWSERS_PATH points the download at a repo-relative
+    # folder instead of the default ~/.cache/ms-playwright, so it's a
+    # normal part of the checkout and travels with the zip below. Azure's
+    # own PLAYWRIGHT_BROWSERS_PATH app setting must point at this same
+    # folder's deployed path so the app finds it at runtime instead of
+    # looking in the (empty) default cache location.
+    - name: Install Playwright's Chromium build
+      run: |
+        pip install playwright
+        PLAYWRIGHT_BROWSERS_PATH=./ms-playwright-browsers python -m playwright install chromium
+
     - name: Zip artifact for deployment
       run: |
         zip -r release.zip . \
