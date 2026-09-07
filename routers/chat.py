@@ -89,9 +89,9 @@ async def chat_endpoint(request: CartesianChatRequest = Body(...)):
 
             poll_url = f"{base_url.rstrip('/')}/exports/rest-api/6a60f95529131252a1e0746a/jobs/{run_id}"
 
-            # Poll until complete or timeout (60 * 2s = ~120s wait — see
-            # cartesian.py's matching change for why 30 (60s) stopped being enough)
-            max_retries = 60
+            # Poll until complete or timeout (150 * 2s = ~300s wait — see
+            # cartesian.py's matching change)
+            max_retries = 150
             for _ in range(max_retries):
                 await asyncio.sleep(2)
                 try:
