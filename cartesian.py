@@ -299,7 +299,12 @@ def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Option
         if isinstance(value, str) and value:
             (tail if seen_products else head).append(value)
         elif isinstance(value, list) and value and all(isinstance(v, str) for v in value):
-            (tail if seen_products else head).append("\n\n".join(value))
+            # A list-of-strings field (e.g. 'choose' on a comparison reply —
+            # one recommendation line per compared product) renders as
+            # markdown bullet points, one item per line, instead of the
+            # single-string fields (e.g. 'closing') which stay as their own
+            # separate message/line break.
+            (tail if seen_products else head).append("\n".join(f"- {v}" for v in value))
     if not head and not tail:
         status = obj.get("status")
         if isinstance(status, dict) and status.get("message"):
