@@ -135,7 +135,7 @@ async def init_db(pool: asyncpg.Pool):
             SELECT 'Columbia Sportswear', $1, $2, $3, $4, true
             WHERE NOT EXISTS (SELECT 1 FROM projects WHERE name = 'Columbia Sportswear')
             """,
-            "6a798ee58953bade21e86591",  # matches cartesian.CARTESIAN_JOB_PATH's export id at the time of this migration
+            "6a60f95529131252a1e0746a",  # matches cartesian.CARTESIAN_JOB_PATH's export id at the time of this migration
             os.getenv("CARTESIAN_CLIENT_ID"),
             os.getenv("CARTESIAN_CLIENT_SECRET"),
             os.getenv("CARTESIAN_BASE_URL"),

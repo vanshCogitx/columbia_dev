@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import db
 from routers import auth, chat, cart, search, evals, testing, projects, hitl, hybrid, traceability
+from routers import google_product_search
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,3 +46,8 @@ app.include_router(projects.router)
 app.include_router(hitl.router)
 app.include_router(hybrid.router)
 app.include_router(traceability.router)
+
+# Wraps the vendored, unmodified Google Product Search tool (see
+# google_product_search/ and google_product_search_mount.py) as real routes
+# on this same app, so they appear on this app's own Swagger docs.
+app.include_router(google_product_search.router)

@@ -14,46 +14,38 @@ import db
 
 logger = logging.getLogger("columbia_backend")
 
-CARTESIAN_JOB_PATH = "/exports/rest-api/6a798ee58953bade21e86591/jobs"
+CARTESIAN_JOB_PATH = "/exports/rest-api/6a60f95529131252a1e0746a/jobs"
 STATUS_MESSAGES = [
-    "Thinking...",
-    "Searching the catalog...",
-    "Fetching product details...",
-    "Looking for deals...",
-    "Checking availability...",
-    "Matching your preferences...",
-    "Comparing options...",
-    "Narrowing down the best picks...",
-    "Reviewing product details...",
-    "Checking sizes and colors...",
-    "Finding the best fit...",
-    "Scanning the inventory...",
-    "Looking for the best match...",
-    "Cross-checking prices...",
-    "Filtering by your needs...",
-    "Gathering recommendations...",
-    "Checking stock levels...",
-    "Reviewing customer favorites...",
-    "Analyzing your request...",
-    "Looking through the collection...",
-    "Finding similar styles...",
-    "Checking product features...",
-    "Verifying availability...",
-    "Curating your options...",
-    "Searching for the right gear...",
-    "Reviewing top picks...",
-    "Checking for the best deals...",
-    "Matching styles to your request...",
-    "Looking at product specs...",
-    "Finalizing your options...",
-    "Double-checking details...",
-    "Exploring the collection...",
-    "Sorting through options...",
-    "Refining your search...",
-    "Putting together your results...",
-    "Checking what's in stock...",
-    "Reviewing the best fits...",
-    "Gathering the details...",
+    "Illuminating your best options...",
+    "Curating a shortlist for you...",
+    "Synthesizing your preferences...",
+    "Enumerating possible matches...",
+    "Cross-referencing prices and availability...",
+    "Calibrating your recommendations...",
+    "Orchestrating your product search...",
+    "Distilling this down to the best picks...",
+    "Reconciling sizes and styles...",
+    "Corroborating product details...",
+    "Optimizing your results...",
+    "Harmonizing your search criteria...",
+    "Consolidating the top picks...",
+    "Excavating a few hidden gems...",
+    "Scrutinizing every detail...",
+    "Evaluating the best fit...",
+    "Appraising your options...",
+    "Tabulating available styles...",
+    "Aggregating recommendations...",
+    "Formulating your shortlist...",
+    "Deducing your perfect match...",
+    "Discerning the best quality options...",
+    "Pinpointing the exact matches...",
+    "Extrapolating from your preferences...",
+    "Deliberating over the finest choices...",
+    "Prioritizing what matters most to you...",
+    "Contextualizing your request...",
+    "Triangulating the best value...",
+    "Unearthing something you'll love...",
+    "Finalizing your curated selection...",
 ]
 
 
@@ -65,8 +57,15 @@ def _product_widget_marker(index: int) -> str:
     return f":::PRODUCT_WIDGET_{index}:::"
 
 
+def _comparison_widget_marker() -> str:
+    """Position marker for a 'comparison' intent's comparison data in a
+    history message's text (same purpose as _product_widget_marker) — only
+    ever one comparison per message, so no index needed."""
+    return ":::PRODUCT_COMPARISON:::"
+
+
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
-_NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType", "type"}
+_NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType", "type", "comparison"}
 
 
 def _extract_ai_text(output_obj: dict) -> Optional[str]:
@@ -102,7 +101,11 @@ async def _call_cartesian_workflow(client: httpx.AsyncClient, url: str, poll_url
         run_id = resp_data.get("runId")
         poll_url = f"{poll_url_base}/{run_id}"
         logger.info("cartesian: job accepted async, runId=%s, polling %s", run_id, poll_url)
-        max_retries = 30
+        # 150 * 2s = 300s. Was 60 (120s) before this — the workflow has
+        # 15-20+ chained agent nodes and some individual nodes alone take
+        # 10+ seconds; giving it a longer ceiling before the earlier
+        # timeout was already observed cutting off mid-execution.
+        max_retries = 150
         for attempt in range(max_retries):
             await asyncio.sleep(2)
             poll_resp = await client.get(poll_url, headers=headers, timeout=10)
@@ -198,6 +201,12 @@ def _extract_structured_obj(ai_text: str) -> Optional[dict]:
         return None
     if not isinstance(obj, dict):
         return None
+    # The 'comparison' intent (and possibly others) wraps every field one
+    # level deeper under a single 'result' key instead of putting them at
+    # the top level like every other intent does — unwrap it here so every
+    # downstream consumer can keep treating the object uniformly.
+    if set(obj.keys()) == {"result"} and isinstance(obj["result"], dict):
+        obj = obj["result"]
     _coerce_products_list(obj)
     _flatten_products(obj)
     _normalize_product_arrays(obj)
@@ -248,21 +257,35 @@ def _iter_product_groups(products) -> list[tuple[Optional[str], Optional[str], l
     return [(None, None, [p for p in products if isinstance(p, dict) and _is_in_stock(p)])]
 
 
-def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], Optional[str], list]], list[str], Optional[dict]]:
+def _iter_comparison_items(comparison) -> list[dict]:
+    """Flat list of items from a 'comparison' intent's 'comparison' field
+    (e.g. two gloves being compared side by side). Streamed as its own
+    comparison event — distinct from product_discovery, since this isn't a
+    browsable catalog result the frontend renders as a product grid, it's a
+    fixed side-by-side comparison."""
+    if not isinstance(comparison, list):
+        return []
+    return [item for item in comparison if isinstance(item, dict)]
+
+
+def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], Optional[str], list]], list[str], list[dict], Optional[dict]]:
     """Streaming variant of _parse_ai_response: instead of hardcoding which
     field names count as narrative text (introduction/orientation/opening/
     recovery/closing), walks the object's own keys in order and treats any
-    non-empty string value as a message — so a new or renamed narrative
-    field from Cartesian is picked up automatically instead of silently
-    dropped. 'products' is pulled out separately as product groups;
+    non-empty string value — or list of strings (e.g. 'choose' on a
+    comparison reply, where several recommendation paragraphs share one key
+    instead of each getting their own) — as a message — so a new or renamed
+    narrative field from Cartesian is picked up automatically instead of
+    silently dropped. 'products'/'comparison' are pulled out separately;
     'status'/'intent'/'contentType' are metadata, not display text.
-    Returns (head, groups, tail, obj): head = narrative strings that
-    appeared before 'products' in the object, tail = the ones that appeared
-    after, obj = the raw parsed object (None for plain-prose responses) so
-    callers can still pull metadata like 'intent' off it if needed."""
+    Returns (head, groups, tail, comparison_items, obj): head = narrative
+    strings that appeared before 'products' in the object, tail = the ones
+    that appeared after, obj = the raw parsed object (None for plain-prose
+    responses) so callers can still pull metadata like 'intent' off it if
+    needed."""
     obj = _extract_structured_obj(ai_text)
     if obj is None:
-        return [ai_text], [], [], None
+        return [ai_text], [], [], [], None
     head: list[str] = []
     tail: list[str] = []
     seen_products = False
@@ -274,6 +297,13 @@ def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Option
             continue
         if isinstance(value, str) and value:
             (tail if seen_products else head).append(value)
+        elif isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+            # A list-of-strings field (e.g. 'choose' on a comparison reply —
+            # one recommendation line per compared product) renders as
+            # markdown bullet points, one item per line, instead of the
+            # single-string fields (e.g. 'closing') which stay as their own
+            # separate message/line break.
+            (tail if seen_products else head).append("\n".join(f"- {v}" for v in value))
     if not head and not tail:
         status = obj.get("status")
         if isinstance(status, dict) and status.get("message"):
@@ -281,7 +311,8 @@ def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Option
         else:
             head = [ai_text]
     groups = _iter_product_groups(obj.get("products"))
-    return head, groups, tail, obj
+    comparison_items = _iter_comparison_items(obj.get("comparison"))
+    return head, groups, tail, comparison_items, obj
 
 
 SESSION_PRODUCTS_TTL_SECONDS = 86400  # cache hygiene only — Postgres (messages table) is the real source of truth
@@ -316,7 +347,7 @@ async def _rebuild_session_products_from_db(chat_id: int) -> list[dict]:
     )
     by_id: dict[str, dict] = {}
     for (text,) in rows:
-        _head, groups, _tail, _obj = _parse_ai_response_parts(text)
+        _head, groups, _tail, _comparison_items, _obj = _parse_ai_response_parts(text)
         for _product_type, _title, items in groups:
             for p in items:
                 if p.get("product_id"):
@@ -478,14 +509,17 @@ async def _generate_and_save_response(
         )
         await _save_message_trace(ai_msg_row["id"], raw_output)
 
-        head, groups, tail, obj = _parse_ai_response_parts(ai_text)
+        head, groups, tail, comparison_items, obj = _parse_ai_response_parts(ai_text)
         product_count = sum(len(items) for _, _, items in groups)
         response_type = obj.get("type") if obj else None
         logger.info(
-            "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d type=%r",
-            len(head), len(groups), product_count, len(tail), response_type,
+            "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d comparison_items=%d type=%r",
+            len(head), len(groups), product_count, len(tail), len(comparison_items), response_type,
         )
-        return {"head": head, "groups": groups, "tail": tail, "type": response_type, "message_id": ai_msg_row["id"]}
+        return {
+            "head": head, "groups": groups, "tail": tail, "comparison_items": comparison_items,
+            "type": response_type, "message_id": ai_msg_row["id"],
+        }
     except Exception as e:
         # Belt-and-braces: this runs detached from any client connection, so
         # an unhandled exception here would otherwise just vanish into an
@@ -570,6 +604,7 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         return
 
     head, groups, tail = result["head"], result["groups"], result["tail"]
+    comparison_items = result.get("comparison_items") or []
 
     # add_to_cart is a distinct UX moment (confirming items just added):
     # the confirmation text goes out as its own add_to_cart event, and the
@@ -581,6 +616,8 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
     if result.get("type") == "add_to_cart":
         message = " ".join(head) if head else None
         yield f"event: add_to_cart\ndata: {json.dumps({'v': {'message': message}})}\n\n"
+        if comparison_items:
+            yield f"event: comparison\ndata: {json.dumps({'v': comparison_items})}\n\n"
         for _product_type, group_title, items in groups:
             if items:
                 if group_title:
@@ -603,7 +640,17 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         logger.info("chat_message: stream complete (add_to_cart) chat_id=%s session_id=%s", chat_id, session_id)
         return
 
-    if head:
+    if comparison_items:
+        # Comparison replies read as: here are the two products, THEN the
+        # narrative ("choose X for Y, opt for Z for W" + a closing line) —
+        # comparison first matches that reading order, and every narrative
+        # field (choose, closing, ...) gets its own event: message instead
+        # of being mashed into one paragraph via " ".join, so the closing
+        # line doesn't visually disappear into the recommendation text.
+        yield f"event: comparison\ndata: {json.dumps({'v': comparison_items})}\n\n"
+        for text in head:
+            yield f"event: message\ndata: {json.dumps({'v': text})}\n\n"
+    elif head:
         head_text = " ".join(head)
         yield f"event: message\ndata: {json.dumps({'v': head_text})}\n\n"
     for _product_type, group_title, items in groups:
@@ -614,8 +661,12 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
             yield f"event: product_discovery\ndata: {json.dumps({'v': items})}\n\n"
             await _cache_session_products(session_id, items)
     if tail:
-        tail_text = " ".join(tail)
-        yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
+        if comparison_items:
+            for text in tail:
+                yield f"event: message\ndata: {json.dumps({'v': text})}\n\n"
+        else:
+            tail_text = " ".join(tail)
+            yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
 
     yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
     # The real, saved database id of the AI message just generated — sent
