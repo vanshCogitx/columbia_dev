@@ -230,7 +230,7 @@ async def get_chat_history(
                 id=msg_id, role="user", content=text, session_id=sid, created_at=_to_iso(created_at),
             ))
         else:
-            head, groups, tail, comparison_items, obj = cartesian._parse_ai_response_parts(text)
+            head, groups, tail, comparison_items, _suggestions, obj = cartesian._parse_ai_response_parts(text)
             is_add_to_cart = bool(obj) and obj.get("type") == "add_to_cart"
             # Only groups that actually have products get a title + marker +
             # widget — matches what live streaming does (skips empty groups,

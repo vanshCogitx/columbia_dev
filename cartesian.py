@@ -14,7 +14,7 @@ import db
 
 logger = logging.getLogger("columbia_backend")
 
-CARTESIAN_JOB_PATH = "/exports/rest-api/6a60f95529131252a1e0746a/jobs"
+CARTESIAN_JOB_PATH = "/exports/rest-api/6a59f1b8285cc674dbd79b87/jobs"
 STATUS_MESSAGES = [
     "Illuminating your best options...",
     "Curating a shortlist for you...",
@@ -65,7 +65,7 @@ def _comparison_widget_marker() -> str:
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
-_NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType", "type", "comparison"}
+_NON_NARRATIVE_KEYS = {"products", "intent", "status", "contentType", "type", "comparison", "suggestions"}
 
 
 def _extract_ai_text(output_obj: dict) -> Optional[str]:
@@ -268,7 +268,18 @@ def _iter_comparison_items(comparison) -> list[dict]:
     return [item for item in comparison if isinstance(item, dict)]
 
 
-def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], Optional[str], list]], list[str], list[dict], Optional[dict]]:
+def _iter_suggestions(suggestions) -> list[str]:
+    """Flat list of follow-up prompt strings from a response's 'suggestions'
+    field (e.g. clickable "Compare X and Y" chips). Streamed as its own
+    event: suggestion instead of falling into the generic narrative
+    bullet-point path, since these are follow-up query text for the user to
+    tap/send, not part of the AI's own message."""
+    if not isinstance(suggestions, list):
+        return []
+    return [s for s in suggestions if isinstance(s, str) and s]
+
+
+def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Optional[str], Optional[str], list]], list[str], list[dict], list[str], Optional[dict]]:
     """Streaming variant of _parse_ai_response: instead of hardcoding which
     field names count as narrative text (introduction/orientation/opening/
     recovery/closing), walks the object's own keys in order and treats any
@@ -276,16 +287,17 @@ def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Option
     comparison reply, where several recommendation paragraphs share one key
     instead of each getting their own) — as a message — so a new or renamed
     narrative field from Cartesian is picked up automatically instead of
-    silently dropped. 'products'/'comparison' are pulled out separately;
-    'status'/'intent'/'contentType' are metadata, not display text.
-    Returns (head, groups, tail, comparison_items, obj): head = narrative
-    strings that appeared before 'products' in the object, tail = the ones
-    that appeared after, obj = the raw parsed object (None for plain-prose
-    responses) so callers can still pull metadata like 'intent' off it if
-    needed."""
+    silently dropped. 'products'/'comparison'/'suggestions' are pulled out
+    separately; 'status'/'intent'/'contentType' are metadata, not display
+    text.
+    Returns (head, groups, tail, comparison_items, suggestions, obj): head =
+    narrative strings that appeared before 'products' in the object, tail =
+    the ones that appeared after, obj = the raw parsed object (None for
+    plain-prose responses) so callers can still pull metadata like 'intent'
+    off it if needed."""
     obj = _extract_structured_obj(ai_text)
     if obj is None:
-        return [ai_text], [], [], [], None
+        return [ai_text], [], [], [], [], None
     head: list[str] = []
     tail: list[str] = []
     seen_products = False
@@ -304,15 +316,21 @@ def _parse_ai_response_parts(ai_text: str) -> tuple[list[str], list[tuple[Option
             # single-string fields (e.g. 'closing') which stay as their own
             # separate message/line break.
             (tail if seen_products else head).append("\n".join(f"- {v}" for v in value))
-    if not head and not tail:
+    groups = _iter_product_groups(obj.get("products"))
+    comparison_items = _iter_comparison_items(obj.get("comparison"))
+    suggestions = _iter_suggestions(obj.get("suggestions"))
+    if not head and not tail and not groups and not comparison_items and not suggestions:
+        # Genuinely nothing usable was extracted (e.g. an object with only
+        # unrecognized/empty fields) — fall back to showing the raw text
+        # rather than silently returning an empty response. A 'suggestions'
+        # (or comparison/products)-only reply is NOT this case: it has real
+        # content, just none of it is narrative prose.
         status = obj.get("status")
         if isinstance(status, dict) and status.get("message"):
             head = [status["message"]]
         else:
             head = [ai_text]
-    groups = _iter_product_groups(obj.get("products"))
-    comparison_items = _iter_comparison_items(obj.get("comparison"))
-    return head, groups, tail, comparison_items, obj
+    return head, groups, tail, comparison_items, suggestions, obj
 
 
 SESSION_PRODUCTS_TTL_SECONDS = 86400  # cache hygiene only — Postgres (messages table) is the real source of truth
@@ -347,7 +365,7 @@ async def _rebuild_session_products_from_db(chat_id: int) -> list[dict]:
     )
     by_id: dict[str, dict] = {}
     for (text,) in rows:
-        _head, groups, _tail, _comparison_items, _obj = _parse_ai_response_parts(text)
+        _head, groups, _tail, _comparison_items, _suggestions, _obj = _parse_ai_response_parts(text)
         for _product_type, _title, items in groups:
             for p in items:
                 if p.get("product_id"):
@@ -509,16 +527,16 @@ async def _generate_and_save_response(
         )
         await _save_message_trace(ai_msg_row["id"], raw_output)
 
-        head, groups, tail, comparison_items, obj = _parse_ai_response_parts(ai_text)
+        head, groups, tail, comparison_items, suggestions, obj = _parse_ai_response_parts(ai_text)
         product_count = sum(len(items) for _, _, items in groups)
         response_type = obj.get("type") if obj else None
         logger.info(
-            "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d comparison_items=%d type=%r",
-            len(head), len(groups), product_count, len(tail), len(comparison_items), response_type,
+            "chat_message: parsed response head=%d groups=%d product_count=%d tail=%d comparison_items=%d suggestions=%d type=%r",
+            len(head), len(groups), product_count, len(tail), len(comparison_items), len(suggestions), response_type,
         )
         return {
             "head": head, "groups": groups, "tail": tail, "comparison_items": comparison_items,
-            "type": response_type, "message_id": ai_msg_row["id"],
+            "suggestions": suggestions, "type": response_type, "message_id": ai_msg_row["id"],
         }
     except Exception as e:
         # Belt-and-braces: this runs detached from any client connection, so
@@ -605,6 +623,7 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
 
     head, groups, tail = result["head"], result["groups"], result["tail"]
     comparison_items = result.get("comparison_items") or []
+    suggestions = result.get("suggestions") or []
 
     # add_to_cart is a distinct UX moment (confirming items just added):
     # the confirmation text goes out as its own add_to_cart event, and the
@@ -628,6 +647,8 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         if tail:
             tail_text = " ".join(tail)
             yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
+        if suggestions:
+            yield f"event: suggestion\ndata: {json.dumps({'v': suggestions})}\n\n"
         yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
         # The real, saved database id of the AI message just generated — sent
         # as its own event so the frontend has a real id to attach to this
@@ -667,6 +688,8 @@ async def _stream_chat_message(session_id: Optional[str], text: str, current_use
         else:
             tail_text = " ".join(tail)
             yield f"event: message\ndata: {json.dumps({'v': tail_text})}\n\n"
+    if suggestions:
+        yield f"event: suggestion\ndata: {json.dumps({'v': suggestions})}\n\n"
 
     yield f"event: conversation_id\ndata: {json.dumps({'v': session_id})}\n\n"
     # The real, saved database id of the AI message just generated — sent
