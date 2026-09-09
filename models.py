@@ -44,6 +44,7 @@ class ChatHistoryMessage(BaseModel):
     content: str
     content_type: Optional[str] = None
     structured_data: Optional[list] = None
+    suggestions: Optional[List[str]] = None
     session_id: Optional[str] = None
     image_url: Optional[str] = None
     created_at: str

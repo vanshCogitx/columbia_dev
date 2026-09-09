@@ -230,7 +230,7 @@ async def get_chat_history(
                 id=msg_id, role="user", content=text, session_id=sid, created_at=_to_iso(created_at),
             ))
         else:
-            head, groups, tail, comparison_items, _suggestions, obj = cartesian._parse_ai_response_parts(text)
+            head, groups, tail, comparison_items, suggestions, obj = cartesian._parse_ai_response_parts(text)
             is_add_to_cart = bool(obj) and obj.get("type") == "add_to_cart"
             # Only groups that actually have products get a title + marker +
             # widget — matches what live streaming does (skips empty groups,
@@ -272,13 +272,22 @@ async def get_chat_history(
                 if has_comparison:
                     structured_data.append(comparison_items)
             else:
-                content = " ".join(head + tail) or text
+                content = " ".join(head + tail)
+                # A suggestions-only reply (no narrative, no products/
+                # comparison) legitimately has empty content — the
+                # suggestions themselves render separately below, same as
+                # live streaming's event: suggestion with no event: message.
+                # Only fall back to the raw text if truly nothing was
+                # extracted at all.
+                if not content and not suggestions:
+                    content = text
             messages.append(ChatHistoryMessage(
                 id=msg_id,
                 role="assistant",
                 content=content,
                 content_type=content_type,
                 structured_data=structured_data,
+                suggestions=suggestions or None,
                 session_id=sid,
                 created_at=_to_iso(created_at),
             ))
