@@ -201,12 +201,16 @@ def _extract_structured_obj(ai_text: str) -> Optional[dict]:
         return None
     if not isinstance(obj, dict):
         return None
-    # The 'comparison' intent (and possibly others) wraps every field one
-    # level deeper under a single 'result' key instead of putting them at
-    # the top level like every other intent does — unwrap it here so every
-    # downstream consumer can keep treating the object uniformly.
-    if set(obj.keys()) == {"result"} and isinstance(obj["result"], dict):
-        obj = obj["result"]
+    # The 'comparison' intent (and possibly others) wraps most fields one
+    # level deeper under a 'result' key instead of putting them at the top
+    # level like every other intent does — sometimes alongside sibling keys
+    # (e.g. 'suggestions') that stay outside 'result'. Unwrap and merge
+    # rather than requiring 'result' to be the only top-level key, so a
+    # sibling field doesn't leave 'result' sealed shut and silently drop
+    # everything inside it (comparison/products/narrative text all live
+    # there).
+    if isinstance(obj.get("result"), dict):
+        obj = {**obj.pop("result"), **obj}
     _coerce_products_list(obj)
     _flatten_products(obj)
     _normalize_product_arrays(obj)
